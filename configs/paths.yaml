@@ -1,0 +1,39 @@
+bdd100k:
+  test:  "C:/Users/PTT933267/Downloads/Puneeth_Adas/Datasets/BDD100k_Extracted/bdd100k/bdd100k/images/100k/test"
+  testA: "C:/Users/PTT933267/Downloads/Puneeth_Adas/Datasets/BDD100k_Extracted/bdd100k/bdd100k/images/100k/test/testA"
+  testB: "C:/Users/PTT933267/Downloads/Puneeth_Adas/Datasets/BDD100k_Extracted/bdd100k/bdd100k/images/100k/test/testB"
+  has_labels: false
+  use_for: "inference and visualization"
+
+idd:
+  frontFar:   "C:/Users/PTT933267/Downloads/Puneeth_Adas/Datasets/IDD/22Gb IDD Detection(Main)/JPEGImages/frontFar"
+  frontNear:  "C:/Users/PTT933267/Downloads/Puneeth_Adas/Datasets/IDD/22Gb IDD Detection(Main)/JPEGImages/frontNear"
+  rearNear:   "C:/Users/PTT933267/Downloads/Puneeth_Adas/Datasets/IDD/22Gb IDD Detection(Main)/JPEGImages/rearNear"
+  sideLeft:   "C:/Users/PTT933267/Downloads/Puneeth_Adas/Datasets/IDD/22Gb IDD Detection(Main)/JPEGImages/sideLeft"
+  sideRight:  "C:/Users/PTT933267/Downloads/Puneeth_Adas/Datasets/IDD/22Gb IDD Detection(Main)/JPEGImages/sideRight"
+  highquality: "C:/Users/PTT933267/Downloads/Puneeth_Adas/Datasets/IDD/22Gb IDD Detection(Main)/JPEGImages/highquality_16k"
+
+  has_labels: false
+  use_for: "Indian traffic inference and visualization"
+  note: "frontFar is most useful - forward facing camera"
+
+kitti:
+  val_root: "C:/Users/PTT933267/Downloads/Puneeth_Adas/Datasets/KITTI/val"
+  train_root: "C:/Users/PTT933267/Downloads/Puneeth_Adas/Datasets/KITTI/train"
+  has_depth_gt: true
+  use_for: "depth estimation validation"
+  note: "image_02=left camera, image_03=right camera"
+
+ua_detrac:
+  images:     "C:/Users/PTT933267/Downloads/Puneeth_Adas/Datasets/UA-Detrac/DETRAC-Images/DETRAC-Images"
+  train_xml:  "C:/Users/PTT933267/Downloads/Puneeth_Adas/Datasets/UA-Detrac/DETRAC-Train-Annotations-XML/DETRAC-Train-Annotations-XML"
+  test_xml:   "C:/Users/PTT933267/Downloads/Puneeth_Adas/Datasets/UA-Detrac/DETRAC-Test-Annotations-XML/DETRAC-Test-Annotations-XML"
+  has_labels: true
+  use_for: "tracking evaluation - MOTA IDF1 metrics"
+
+outputs:
+  root:    "outputs"
+  frames:  "outputs/frames"
+  metrics: "outputs/metrics"
+  logs:    "outputs/logs"
+  videos:  "outputs/videos"
