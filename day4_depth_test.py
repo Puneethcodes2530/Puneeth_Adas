@@ -15,8 +15,8 @@ from perception.depth_estimator import DepthEstimator
 from perception.adaptive_detector import AdaptiveDetector
 
 # ── PATHS ──────────────────────────────────────────────────
-BDD_PATH = r"C:\Users\PTT933267\Downloads\Puneeth_Adas\Datasets\BDD100k_Extracted\bdd100k\bdd100k\images\100k\test"
-IDD_PATH = r"C:\Users\PTT933267\Downloads\Puneeth_Adas\Datasets\IDD\22Gb IDD Detection(Main)\JPEGImages\frontFar"
+BDD_PATH = r"C:\Users\PTT933267\Downloads\Puneeth_Adas\Datasets\BDD100k_Extracted\bdd100k\bdd100k\images\100k\test\e9cdc338-ab4824c7.jpg"
+IDD_PATH = r"C:\Users\PTT933267\Downloads\Puneeth_Adas\Datasets\IDD\22Gb IDD Detection(Main)\JPEGImages\frontFar\BLR-2018-04-26_13-40-01_frontFar\000882_r.jpg"
 
 # ── Load models ────────────────────────────────────────────
 print("Loading models...")
@@ -24,9 +24,7 @@ depth_est = DepthEstimator()
 detector = AdaptiveDetector('yolov8s.pt')
 
 # ── Get test images ────────────────────────────────────────
-images = (glob.glob(f"{BDD_PATH}/*.jpg") +
-          glob.glob(f"{IDD_PATH}/**/*.jpg",
-                    recursive=True))[:4]
+images = [BDD_PATH, IDD_PATH]
 
 if not images:
     print("Update paths above")

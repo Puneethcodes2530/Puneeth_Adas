@@ -20,4 +20,5 @@ Thumbs.db
 .DS_Store
 
 # Optional (models)
+*.pt
 models/

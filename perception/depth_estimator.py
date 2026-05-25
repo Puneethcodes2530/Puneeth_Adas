@@ -1,6 +1,6 @@
 """
 NeuroSentinel v3 — OpenCV Depth Estimator (MiDaS ONNX)
-NO TORCH, NO ADMIN REQUIRED ✅
+NO TORCH, NO ADMIN REQUIRED 
 """
 
 import cv2
@@ -35,78 +35,108 @@ class DepthOutput:
         if roi.size == 0:
             return {'distance_m': 999.0, 'confidence': 0.0}
 
-        distance = float(np.percentile(roi, 15))
+        distance = float(np.percentile(roi, 20))
+        distance = max(distance, 0.05)
+
+        # ✅ Object-level smoothing
+        key = (x1, y1, x2, y2)
+
+        if hasattr(self, "prev_distances") and key in self.prev_distances:
+            distance = 0.8 * self.prev_distances[key] + 0.2 * distance
+
+        if hasattr(self, "prev_distances"):
+            self.prev_distances[key] = distance
+
+        # Confidence
+        spread = np.std(roi)
+        confidence = float(np.clip(1.0 - spread, 0.0, 1.0))
+
+        distance_m = distance * 25 + 2
 
         return {
-            'distance_m': round(distance, 1),
-            'confidence': 0.8
+            'distance_m': round(distance_m, 1),
+            'confidence': round(confidence, 2)
         }
 
 
+
 class DepthEstimator:
-    def __init__(self, model_path="models/midas_small.onnx"):
+    def __init__(self, model_path="models/midas_v21_384.onnx"):
         print("Loading MiDaS ONNX model...")
         self.net = cv2.dnn.readNet(model_path)
         self.model_name = "MiDaS-ONNX"
+        self.prev_depth = None
+        self.prev_distances = {}
+
 
     def estimate(self, frame):
         t = time.perf_counter()
 
         h, w = frame.shape[:2]
 
-        # preprocess
+        # Correct preprocessing for DPT Hybrid ONNX
         img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        img = cv2.resize(img, (256, 256), interpolation=cv2.INTER_CUBIC)
+        img = cv2.resize(img, (384, 384))
 
         img = img / 255.0
-        mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        std  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        img = (img - 0.5) / 0.5   # correct normalization
 
-        img = (img - mean) / std
         img = img.transpose(2, 0, 1)
-
         blob = np.expand_dims(img, axis=0).astype(np.float32)
 
+        # Inference
         self.net.setInput(blob)
         depth = self.net.forward()
 
         depth = depth[0, 0]
 
-        # Smooth and enhance structure
+        # Smooth depth
         depth = cv2.GaussianBlur(depth, (5, 5), 0)
 
-        # resize back
+        # Resize back
         depth_resized = cv2.resize(depth, (w, h))
 
-        # normalize to meters (approx scale)
-        d_min, d_max = depth_resized.min(), depth_resized.max()
-        
-        depth_norm = (depth_resized - d_min) / (d_max - d_min + 1e-6)
+        # Normalize (keep RELATIVE depth, not fake meters)
+        # Remove extreme spikes
+        depth_clamped = np.clip(depth_resized, 0, np.percentile(depth_resized, 95))
 
-        # Convert to metric-like scale
-        
-        # Reintroduce inversion (model expects it)
-        depth_metric = (1.0 - depth_norm)
+        d_min = depth_clamped.min()
+        d_max = depth_clamped.max()
 
-        # Expand dynamic range
-        depth_metric = np.power(depth_metric, 1.2) * 80.0
+        depth_norm = (depth_clamped - d_min) / (d_max - d_min + 1e-6)
+
+        # Temporal smoothing (ADAS stability)
+        if self.prev_depth is not None and self.prev_depth.shape == depth_norm.shape:
+            depth_norm = 0.7 * self.prev_depth + 0.3 * depth_norm
 
 
+        self.prev_depth = depth_norm.copy()
 
         ms = (time.perf_counter() - t) * 1000
 
-        return DepthOutput(
-            depth_map=depth_metric.astype(np.float32),
-            uncertainty=np.ones_like(depth_metric) * 0.3,
+        out = DepthOutput(
+            depth_map=depth_norm.astype(np.float32),
+            uncertainty=np.ones_like(depth_norm) * 0.3,
             processing_ms=ms,
             model_name=self.model_name
         )
+
+        out.prev_distances = self.prev_distances
+
+        if len(self.prev_distances) > 100:
+            self.prev_distances.clear()
+
+
+        return out
 
     def visualize(self, frame, depth_output):
         depth = depth_output.depth_map
         h, w = frame.shape[:2]
 
-        d_vis = cv2.normalize(depth, None, 0, 255, cv2.NORM_MINMAX)
+        
+        d_vis = (depth * 255).astype(np.uint8)
+        d_vis = cv2.equalizeHist(d_vis)
+
         d_vis = d_vis.astype(np.uint8)
 
         d_color = cv2.applyColorMap(d_vis, cv2.COLORMAP_INFERNO)
