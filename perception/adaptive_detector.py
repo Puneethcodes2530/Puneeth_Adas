@@ -23,7 +23,7 @@ from perception.scene_detector import SceneDetector, SceneState
 class Detection:
     class_name: str
     raw_confidence: float
-    adj_confidence: float # after scene penalty
+    adj_confidence: float # This is after the scene penalty
     bbox: List[int] # [x1,y1,x2,y2]
     width_px: int
     height_px: int
