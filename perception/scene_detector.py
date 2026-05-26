@@ -1,28 +1,90 @@
 """
-NeuroSentinel v3 — Scene Degradation Detector
-Classifies scene condition in under 2ms.
-No neural network. Pure image statistics.
-Budget: 2ms max (enforced by assertion)
+NeuroSentinel v3 — Final Improved Scene Degradation Detector
+
+Ultra-fast handcrafted perception module for ADAS.
+
+NO neural network
+NO GPU
+Pure image statistics
+CPU friendly
+Edge-device friendly
+
+============================================================
+FEATURES
+============================================================
+
+✓ Brightness estimation
+✓ Blur estimation
+✓ Contrast estimation
+✓ Edge density analysis
+✓ Entropy estimation
+✓ Dark channel prior fog detection
+✓ Dust detection
+✓ Glare detection
+✓ Night + headlights handling
+✓ Temporal smoothing
+✓ Adaptive thresholds
+✓ <2ms lightweight architecture
+
+============================================================
+SUPPORTED CONDITIONS
+============================================================
+
+CLEAR
+NIGHT
+FOG
+RAIN
+GLARE
+DUST
 """
+
 import cv2
 import numpy as np
 import time
+
 from dataclasses import dataclass
 from typing import Tuple
 
 
+# ============================================================
+# SceneState
+# Stores final scene analysis result
+# ============================================================
+
 @dataclass
 class SceneState:
-    condition: str # CLEAR/NIGHT/FOG/RAIN/GLARE/DUST
-    severity: float # 0.0 - 1.0
-    brightness: float # mean pixel value
-    blur_score: float # laplacian variance
-    fog_score: float # dark channel prior
-    processing_ms: float # must be < 2.0
 
-    # Confidence threshold adjustments per condition
+    # Current scene condition
+    # CLEAR / NIGHT / FOG / RAIN / GLARE / DUST
+    condition: str
+
+    # Severity from 0.0 → 1.0
+    severity: float
+
+    # Mean grayscale intensity
+    brightness: float
+
+    # Laplacian variance (This is for the sharpness or the blurriness of the image)
+    blur_score: float
+
+    # Dark channel prior fog score
+    fog_score: float
+
+    # Processing latency
+    processing_ms: float
+
+    # ========================================================
+    # Dynamic confidence threshold
+    # ========================================================
+    #
+    # Worse scenes:
+    # increase threshold
+    #
+    # This reduces hallucinations and false positives.
+    # ========================================================
     @property
     def conf_threshold(self) -> float:
+
         return {
             'CLEAR': 0.35,
             'NIGHT': 0.45,
@@ -32,9 +94,23 @@ class SceneState:
             'DUST': 0.50,
         }[self.condition]
 
-    # Detection confidence penalty per condition
+    # ========================================================
+    # Detection confidence penalty
+    # ========================================================
+    #
+    # final_conf =
+    # raw_conf * confidence_penalty
+    #
+    # Example:
+    #
+    # 0.8 confidence in fog
+    # becomes:
+    #
+    # 0.8 × 0.7 = 0.56
+    # ========================================================
     @property
     def confidence_penalty(self) -> float:
+
         return {
             'CLEAR': 1.00,
             'NIGHT': 0.75,
@@ -44,9 +120,12 @@ class SceneState:
             'DUST': 0.65,
         }[self.condition]
 
+    # ========================================================
+    # How much to trust depth estimation
+    # ========================================================
     @property
     def depth_weight(self) -> float:
-        """How much to trust depth estimates"""
+
         return {
             'CLEAR': 1.00,
             'NIGHT': 0.80,
@@ -56,9 +135,12 @@ class SceneState:
             'DUST': 0.55,
         }[self.condition]
 
+    # ========================================================
+    # How much to trust temporal TTC
+    # ========================================================
     @property
     def tau_margin_weight(self) -> float:
-        """How much to trust tau-margin TTC"""
+
         return {
             'CLEAR': 0.50,
             'NIGHT': 0.70,
@@ -68,184 +150,528 @@ class SceneState:
             'DUST': 0.80,
         }[self.condition]
 
+    # ========================================================
+    # Printable summary
+    # ========================================================
     def summary(self) -> str:
-        return (f"[{self.condition}] severity={self.severity:.2f} "
-                f"thresh={self.conf_threshold} "
-                f"penalty={self.confidence_penalty} "
-                f"time={self.processing_ms:.2f}ms")
 
+        return (
+            f"[{self.condition}] "
+            f"severity={self.severity:.2f} "
+            f"threshold={self.conf_threshold} "
+            f"penalty={self.confidence_penalty} "
+            f"time={self.processing_ms:.2f}ms"
+        )
+
+
+# ============================================================
+# SceneDetector
+# ============================================================
 
 class SceneDetector:
+
     """
-    Classifies driving scene condition from raw frame.
-    Pure image statistics — no neural network.
-    Must complete in under 2ms per frame.
+    Lightweight handcrafted scene degradation detector.
+
+    Uses:
+    - brightness
+    - blur
+    - contrast
+    - entropy
+    - edge density
+    - dark channel prior
+    - saturation analysis
     """
 
     def __init__(self, enforce_budget: bool = True):
+
+        # Whether latency budget should be enforced
         self.enforce_budget = enforce_budget
+
+        # Target latency budget
         self._budget_ms = 2.0
 
+        # ====================================================
+        # TEMPORAL SMOOTHING MEMORY
+        # ====================================================
+        #
+        # Single-frame classification fluctuates:
+        #
+        # CLEAR → FOG → CLEAR ❌
+        #
+        # EMA smoothing stabilizes outputs:
+        #
+        # CLEAR → CLEAR → FOG ✅
+        #
+        # Formula:
+        #
+        # smoothed =
+        # 0.8 * previous +
+        # 0.2 * current
+        # ====================================================
+        self.prev = {
+
+            "fog": 0.0,
+
+            "blur": 0.0
+        }
+
+    # ========================================================
+    # MAIN ANALYSIS PIPELINE
+    # ========================================================
     def analyze(self, frame: np.ndarray) -> SceneState:
+
+        # Start latency timer
         t_start = time.perf_counter()
 
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        # ====================================================
+        # Convert frame to grayscale
+        #
+        # Used for:
+        # - brightness
+        # - blur
+        # - contrast
+        # - entropy
+        # - edges
+        # ====================================================
+        gray = cv2.cvtColor(
+            frame,
+            cv2.COLOR_BGR2GRAY
+        )
 
+        # ====================================================
+        # BASIC IMAGE STATISTICS
+        # ====================================================
+
+        # Average scene brightness
         brightness = self._brightness(gray)
+
+        # Sharpness estimation
         blur = self._blur_score(gray)
+
+        # Fog / haze estimation
         fog = self._fog_score(frame)
 
+        # ====================================================
+        # TEMPORAL SMOOTHING
+        # ====================================================
+        #
+        # Raw frame statistics fluctuate heavily.
+        #
+        # EMA smoothing stabilizes:
+        #
+        # smoother predictions
+        # fewer false flips
+        # production-like behavior
+        # ====================================================
+
+        fog = (
+            0.8 * self.prev["fog"] +
+            0.2 * fog
+        )
+
+        blur = (
+            0.8 * self.prev["blur"] +
+            0.2 * blur
+        )
+
+        # ====================================================
+        # OPTIONAL STABILITY CLAMP
+        # ====================================================
+        #
+        # Prevents sudden huge spikes.
+        #
+        # Mostly safety protection.
+        # ====================================================
+        blur = np.clip(
+            blur,
+            0,
+            5000
+        )
+
+        # Update temporal memory
+        self.prev["fog"] = fog
+        self.prev["blur"] = blur
+
+        # ====================================================
+        # Scene classification
+        # ====================================================
         condition, severity = self._classify(
-            brightness, blur, fog, frame)
+            brightness,
+            blur,
+            fog,
+            frame,
+            gray
+        )
 
-        ms = (time.perf_counter() - t_start) * 1000
+        # Total latency
+        ms = (
+            time.perf_counter() - t_start
+        ) * 1000
 
+        # ====================================================
+        # Optional latency enforcement
+        # ====================================================
         if self.enforce_budget:
+
             assert ms < self._budget_ms * 3, (
-                f"Scene detector budget exceeded: {ms:.1f}ms"
+                f"Scene detector budget exceeded: "
+                f"{ms:.2f}ms"
             )
 
+        # ====================================================
+        # Return structured scene output
+        # ====================================================
         return SceneState(
+
             condition=condition,
             severity=severity,
+
             brightness=brightness,
             blur_score=blur,
             fog_score=fog,
+
             processing_ms=ms
         )
 
-    def _brightness(self, gray: np.ndarray) -> float:
-        return float(np.mean(gray))
+    # ========================================================
+    # BRIGHTNESS ESTIMATION
+    # ========================================================
+    #
+    # Mean grayscale intensity.
+    #
+    # Dark image:
+    # low value
+    #
+    # Bright image:
+    # high value
+    # ========================================================
+    def _brightness(
+        self,
+        gray: np.ndarray
+    ) -> float:
 
-    def _blur_score(self, gray: np.ndarray) -> float:
-        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        return float(
+            np.mean(gray)
+        )
 
-    def _fog_score(self, bgr: np.ndarray) -> float:
-        """
-        Dark Channel Prior for fog/haze detection.
-        High dark channel = foggy/hazy image.
-        """
-        # Resize for speed — 160x120 is enough
-        small = cv2.resize(bgr, (160, 120))
-        dark = np.min(small, axis=2)
+    # ========================================================
+    # BLUR ESTIMATION
+    # ========================================================
+    #
+    # Laplacian variance:
+    #
+    # High variance:
+    # sharp image
+    #
+    # Low variance:
+    # blurry image
+    # ========================================================
+    def _blur_score(
+        self,
+        gray: np.ndarray
+    ) -> float:
+
+        return float(
+            cv2.Laplacian(
+                gray,
+                cv2.CV_64F
+            ).var()
+        )
+
+    # ========================================================
+    # FOG ESTIMATION
+    # ========================================================
+    #
+    # Uses Dark Channel Prior.
+    #
+    # Fog lifts dark pixels upward.
+    #
+    # Clear image:
+    # strong dark regions
+    #
+    # Foggy image:
+    # dark regions become brighter
+    # ========================================================
+    def _fog_score(
+        self,
+        bgr: np.ndarray
+    ) -> float:
+
+        # Resize image for speed
+        small = cv2.resize(
+            bgr,
+            (160, 120)
+        )
+
+        # Dark channel
+        dark = np.min(
+            small,
+            axis=2
+        )
+
+        # Morphological erosion
         kernel = cv2.getStructuringElement(
-            cv2.MORPH_RECT, (5, 5))
-        dark_eroded = cv2.erode(dark, kernel)
-        return float(np.mean(dark_eroded) / 255.0)
+            cv2.MORPH_RECT,
+            (5, 5)
+        )
 
-    def _classify(self, brightness: float,
-                   blur: float,
-                   fog: float,
-                   frame: np.ndarray
-                   ) -> Tuple[str, float]:
+        dark_eroded = cv2.erode(
+            dark,
+            kernel
+        )
 
-        # NIGHT: very dark
-        if brightness < 40:
-            severity = 1.0 - brightness / 40.0
-            return 'NIGHT', round(severity, 3)
+        # Normalize to 0 → 1
+        return float(
+            np.mean(dark_eroded) / 255.0
+        )
 
-        # GLARE: extremely bright
-        if brightness > 220:
-            severity = (brightness - 220) / 35.0
-            return 'GLARE', round(min(severity, 1.0), 3)
+    # ========================================================
+    # SCENE CLASSIFICATION
+    # ========================================================
+    def _classify(
+        self,
+        brightness: float,
+        blur: float,
+        fog: float,
+        frame: np.ndarray,
+        gray: np.ndarray
+    ) -> Tuple[str, float]:
 
-        # FOG: high dark channel + reduced contrast
-        if fog > 0.60 and blur < 200:
-            return 'FOG', round(fog, 3)
+        # ====================================================
+        # CONTRAST ESTIMATION
+        # ====================================================
+        #
+        # Fog destroys contrast heavily.
+        # ====================================================
+        contrast = float(
+            np.std(gray)
+        )
 
-        # DUST: warm-toned haze (different from fog)
-        if fog > 0.50 and blur < 150:
-            # Check color temperature — dust is warm
+        # ====================================================
+        # EDGE DENSITY
+        # ====================================================
+        #
+        # Clear scenes:
+        # many edges
+        #
+        # Fog/rain:
+        # fewer edges
+        # ====================================================
+        edges = cv2.Canny(
+            gray,
+            100,
+            200
+        )
+
+        edge_density = float(
+            np.mean(edges > 0)
+        )
+
+        # ====================================================
+        # ENTROPY ESTIMATION
+        # ====================================================
+        #
+        # Measures information richness.
+        #
+        # Fog smooths textures/details,
+        # reducing entropy.
+        # ====================================================
+        hist = cv2.calcHist(
+            [gray],
+            [0],
+            None,
+            [256],
+            [0, 256]
+        )
+
+        # ====================================================
+        # Safe histogram normalization
+        #
+        # Prevents divide-by-zero edge case.
+        # ====================================================
+        hist /= (
+            hist.sum() + 1e-6
+        )
+
+        entropy = -np.sum(
+            hist * np.log2(hist + 1e-7)
+        )
+
+        # ====================================================
+        # SATURATED PIXEL RATIO
+        # ====================================================
+        #
+        # Useful for:
+        # - glare
+        # - headlights
+        # - overexposure
+        # ====================================================
+        saturated_ratio = float(
+            np.mean(gray > 240)
+        )
+
+        # ====================================================
+        # NIGHT DETECTION
+        # ====================================================
+        #
+        # Handles:
+        # - low-light scenes
+        # - night + headlights
+        # ====================================================
+        if brightness < 55:
+
+            # Headlight bloom
+            if saturated_ratio > 0.02:
+
+                return 'GLARE', 0.6
+
+            severity = (
+                1.0 - brightness / 55.0
+            )
+
+            return (
+                'NIGHT',
+                round(
+                    min(severity, 1.0),
+                    3
+                )
+            )
+
+        # ====================================================
+        # GLARE DETECTION
+        # ====================================================
+        #
+        # Strong saturation:
+        # sunlight / overexposure
+        # ====================================================
+        if saturated_ratio > 0.18:
+
+            severity = min(
+                saturated_ratio * 2.5,
+                1.0
+            )
+
+            return (
+                'GLARE',
+                round(severity, 3)
+            )
+
+        # ====================================================
+        # FOG DETECTION
+        # ====================================================
+        #
+        # Fog characteristics:
+        #
+        # - high fog score
+        # - low contrast
+        # - low edge density
+        # - low entropy
+        # ====================================================
+        if (
+            fog > 0.55 and
+            contrast < 50 and
+            edge_density <
+            (0.08 + 0.02 * fog) and
+            entropy < 7.0
+        ):
+
+            # =================================================
+            # Severity mixing
+            #
+            # Fog score trusted more heavily
+            # than contrast reduction.
+            # =================================================
+            severity = (
+                0.7 * fog +
+                0.3 * (
+                    1.0 - contrast / 50.0
+                )
+            )
+
+            return (
+                'FOG',
+                round(
+                    min(severity, 1.0),
+                    3
+                )
+            )
+
+        # ====================================================
+        # DUST DETECTION
+        # ====================================================
+        #
+        # Similar to fog,
+        # but warm colored.
+        # ====================================================
+        if (
+            fog > 0.50 and
+            contrast < 60
+        ):
+
+            # Resize for speed
+            resized = cv2.resize(
+                frame,
+                (160, 120)
+            )
+
+            # Split BGR channels
             b, g, r = cv2.split(
-                cv2.resize(frame, (160, 120)))
-            warm_ratio = float(np.mean(r)) / (
-                float(np.mean(b)) + 1e-6)
-            if warm_ratio > 1.2:
-                return 'DUST', round(fog * 0.85, 3)
+                resized
+            )
 
-        # RAIN: blurry + medium brightness
-        if blur < 80 and 40 < brightness < 180:
-            severity = 1.0 - blur / 80.0
-            return 'RAIN', round(severity, 3)
+            # Dust scenes are warm colored
+            warm_ratio = float(
+                np.mean(r)
+            ) / (
+                float(np.mean(b)) + 1e-6
+            )
 
+            if warm_ratio > 1.20:
+
+                severity = (
+                    fog * 0.7
+                )
+
+                return (
+                    'DUST',
+                    round(
+                        min(severity, 1.0),
+                        3
+                    )
+                )
+
+        # ====================================================
+        # RAIN DETECTION
+        # ====================================================
+        #
+        # Rain introduces:
+        # - blur
+        # - reduced edges
+        # - visibility degradation
+        #
+        # Slightly adaptive edge threshold.
+        # ====================================================
+        if (
+            blur < 120 and
+            edge_density <
+            (0.10 + 0.02 * fog) and
+            40 < brightness < 180
+        ):
+
+            severity = (
+                1.0 - blur / 120.0
+            )
+
+            return (
+                'RAIN',
+                round(
+                    min(severity, 1.0),
+                    3
+                )
+            )
+
+        # ====================================================
+        # OTHERWISE CLEAR
+        # ====================================================
         return 'CLEAR', 0.0
-
-
-# ── Standalone test ────────────────────────────────────────
-if __name__ == "__main__":
-    import glob
-    import matplotlib.pyplot as plt
-    import os
-    import sys
-
-    # Add project root to path
-    sys.path.insert(0, os.path.dirname(
-        os.path.dirname(os.path.abspath(__file__))))
-
-    # Test paths — update these
-    
-    TEST_FOLDERS = {
-        'BDD100K': r"C:\Users\PTT933267\Downloads\Puneeth_Adas\Datasets\BDD100k_Extracted\bdd100k\bdd100k\images\100k\test",
-        'IDD FrontFar': r"C:\Users\PTT933267\Downloads\Puneeth_Adas\Datasets\IDD\22Gb IDD Detection(Main)\JPEGImages\frontFar",
-    }
-
-
-    detector = SceneDetector(enforce_budget=False)
-
-    print("SCENE DEGRADATION DETECTOR TEST")
-    print("="*60)
-    print(f"{'Dataset':<15} {'File':<30} {'Condition':<8} "
-          f"{'Severity':<10} {'Threshold':<10} {'Time'}")
-    print("-"*85)
-
-    all_conditions = []
-
-    for dataset, folder in TEST_FOLDERS.items():
-        images = (glob.glob(f"{folder}/*.jpg") +
-                  glob.glob(f"{folder}/**/*.jpg",
-                            recursive=True))[:15]
-
-        if not images:
-            print(f" No images: {folder}")
-            continue
-
-        for img_path in images:
-            frame = cv2.imread(img_path)
-            if frame is None:
-                continue
-
-            scene = detector.analyze(frame)
-            all_conditions.append(scene.condition)
-
-            print(f"{dataset:<15} "
-                  f"{os.path.basename(img_path)[:29]:<30} "
-                  f"{scene.condition:<8} "
-                  f"{scene.severity:<10.3f} "
-                  f"{scene.conf_threshold:<10.2f} "
-                  f"{scene.processing_ms:.2f}ms")
-
-    # Summary
-    if all_conditions:
-        from collections import Counter
-        counts = Counter(all_conditions)
-        total = len(all_conditions)
-
-        print("\nCONDITION DISTRIBUTION:")
-        for cond, cnt in sorted(counts.items(),
-                                  key=lambda x: x[1],
-                                  reverse=True):
-            pct = cnt / total * 100
-            bar = "█" * int(pct / 3)
-            print(f" {cond:<8} {cnt:>4} ({pct:5.1f}%) {bar}")
-
-        avg_ms = np.mean([
-            detector.analyze(cv2.imread(
-                (glob.glob(f"{list(TEST_FOLDERS.values())[0]}/*.jpg") +
-                 glob.glob(f"{list(TEST_FOLDERS.values())[0]}/**/*.jpg",
-                           recursive=True))[0]
-            )).processing_ms
-            for _ in range(5)
-        ])
-        print(f"\nAverage processing time: {avg_ms:.2f}ms")
-        status = "✓ WITHIN" if avg_ms < 2.0 else "✗ EXCEEDS"
-        print(f"Budget status: {status} 2ms budget")

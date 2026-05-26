@@ -1,47 +1,48 @@
-
 """
-NeuroSentinel v3 — Adaptive Detection Pipeline
+Adaptive Detection Pipeline
 Combines SceneDetector + YOLOv8 with dynamic thresholds.
 This is Phase 2 complete pipeline.
 """
-import cv2
-import numpy as np
-import time
-import json
-import os
-import sys
-from dataclasses import dataclass, field
-from typing import List, Optional
+import cv2 # Computer vision library used for image handling, drawing boxes and test and processing(resizing, color conversion , blur and filters)
+import numpy as np #Matrix, Math operations
+import time #Time measurement module
+import json #Data storage in JSON format
+import os #OS interface, used for file handling and directory creation
+import sys #System level operations to allow imports from other files and stuff
+from dataclasses import dataclass, field #A cleaner way to create data structures
+from typing import List, Optional # For readability, and better use case
 
 sys.path.insert(0, os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))))
-
-from perception.scene_detector import SceneDetector, SceneState
+#__file__ shows the current file path and the abspath converts it into absolute path, next the os.path.dirname, moves it a level up and one more on the outside moves it even one more level up so pushing us to the root folder
+#The last sys.path.insert(0, ...) ensures to include this in the python import search path, for importing further files like below in future
+from perception.scene_detector import SceneState #We ONLY need SceneState now ✅
+from perception.clip_scene_detector import CLIPSceneDetector #CLIP imported ✅
 
 
 @dataclass
 class Detection:
-    class_name: str
-    raw_confidence: float
-    adj_confidence: float # This is after the scene penalty
-    bbox: List[int] # [x1,y1,x2,y2]
-    width_px: int
-    height_px: int
-    est_distance_m: float # heuristic — replaced later
-    is_vru: bool # pedestrian/cyclist/motorcycle
+    class_name: str #The detected object is stored as a string as either car, truck, person, motorcycle
+    raw_confidence: float #Original yolo confidence score that the model gives
+    adj_confidence: float # This is after the scene penalty (if raw confidence is 0.8 and penalty is 0.7, it becomes 0.8*0.7=0.56)
+    bbox: List[int] # [x1,y1,x2,y2] for the coordinates of the bounding box, top left is (x1,y1), bottom right is (x2,y2)
+    width_px: int #width of the object calculated as x2-x1
+    height_px: int #height of the object is calculated as y2-y1
+    est_distance_m: float # heuristic — replaced later with hybrid(depth+geometry)
+    is_vru: bool # pedestrian/cyclist/motorcycle, Adas gives higher priority to VRU's
 
 
 @dataclass
 class FrameOutput:
-    frame_id: int
-    timestamp_ms: float
-    scene: SceneState
-    detections: List[Detection]
-    n_objects: int
-    processing_ms: float
-    within_budget: bool
+    frame_id: int #Each frame gets it's own number
+    timestamp_ms: float #Time when frame was processed
+    scene: SceneState #Output from the Scenestate that we imported, useful like for finding if it is night and all
+    detections: List[Detection] #List of all the objects in the frame
+    n_objects: int #len(detections), basically for the number of the objects detected in the frame
+    processing_ms: float #Time taken to process whole pipeline, Object detection+depth+scene detection
+    within_budget: bool #for now capped at 40ms, but lets see regarding optimization on the later parts...
 
-    def to_dict(self) -> dict:
+    def to_dict(self) -> dict: #Converts the frame output object to a dictionary, for easy future json output and all
         return {
             'frame_id': self.frame_id,
             'timestamp_ms': self.timestamp_ms,
@@ -67,33 +68,19 @@ class FrameOutput:
 
 
 class AdaptiveDetector:
-    """
-    Phase 2 complete detection pipeline.
-
-    Fixed threshold (naive):
-      Always use 0.35 confidence regardless of conditions.
-      Result: many false positives at night/fog.
-
-    Adaptive threshold (NeuroSentinel):
-      1. Detect scene condition (2ms)
-      2. Adjust confidence threshold per condition
-      3. Apply confidence penalty to all detections
-      4. Result: fewer false positives, more robust
-
-    This is your first novel contribution working.
-    """
 
     VRU_CLASSES = {
-        'person', 'bicycle', 'motorcycle'}
+        'person', 'bicycle', 'motorcycle',
+        'dog', 'cat', 'horse', 'cow'
+    }
 
     ADAS_CLASSES = {
         'person', 'bicycle', 'motorcycle',
-        'car', 'truck', 'bus',
-        'traffic light', 'stop sign'
+        'car', 'truck', 'bus','rickshaw'
+        'traffic light', 'stop sign',
+        'dog', 'cat', 'horse', 'cow'
     }
 
-    # Heuristic distance: focal_length * real_height / pixel_height
-    # Approximate real heights (metres)
     REAL_HEIGHTS = {
         'person': 1.75,
         'car': 1.50,
@@ -102,39 +89,54 @@ class AdaptiveDetector:
         'bicycle': 1.10,
         'motorcycle': 1.20,
     }
+
     FOCAL_LENGTH = 720 # approximate for dashcam
 
     def __init__(self, model_weights: str = 'yolov8s.pt',
                  budget_ms: float = 40.0):
+
         from ultralytics import YOLO
+
         print(f"Loading {model_weights}...")
         self.model = YOLO(model_weights)
-        self.scene = SceneDetector(enforce_budget=False)
+
         self.budget = budget_ms
         self.frame_id = 0
-        print("✓ AdaptiveDetector ready")
+
+        # ✅ CLIP initialized correctly
+        self.clip = CLIPSceneDetector()
+
+        print("The AdaptiveDetector Module is ready")
 
     def process(self, frame: np.ndarray) -> FrameOutput:
-        """
-        Full adaptive pipeline on one frame.
-        Returns FrameOutput with all detections.
-        """
+
         t_total = time.perf_counter()
         self.frame_id += 1
 
-        # Step 1: Scene analysis
-        scene_state = self.scene.analyze(frame)
+        # ✅ STEP 1: CLIP Scene detection
+        clip_condition, clip_conf = self.clip.analyze(frame)
 
-        # Step 2: Detection with adaptive threshold
+        scene_state = SceneState(
+            condition=clip_condition,
+            severity=(1.0 - clip_conf),  # ✅ BETTER logic
+            brightness=0.0,
+            blur_score=0.0,
+            fog_score=0.0,
+            processing_ms=0.0
+        )
+
+        # ✅ STEP 2: YOLO detection
         results = self.model(
             frame,
             conf=scene_state.conf_threshold,
             verbose=False
         )
+
         result = results[0]
 
-        # Step 3: Process detections
+        # ✅ STEP 3: Process detections
         detections = []
+
         for box in result.boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
             raw_conf = float(box.conf[0])
@@ -143,10 +145,8 @@ class AdaptiveDetector:
             if cls_name not in self.ADAS_CLASSES:
                 continue
 
-            # Apply scene penalty
             adj_conf = raw_conf * scene_state.confidence_penalty
 
-            # Heuristic distance
             h_px = max(y2 - y1, 1)
             r_h = self.REAL_HEIGHTS.get(cls_name, 1.5)
             dist = round(self.FOCAL_LENGTH * r_h / h_px, 1)
@@ -174,9 +174,8 @@ class AdaptiveDetector:
             within_budget=(total_ms <= self.budget)
         )
 
-    def draw(self, frame: np.ndarray,
-              output: FrameOutput) -> np.ndarray:
-        """Draw detections + scene HUD on frame."""
+    def draw(self, frame: np.ndarray, output: FrameOutput) -> np.ndarray:
+
         vis = frame.copy()
         h, w = vis.shape[:2]
 
@@ -200,75 +199,66 @@ class AdaptiveDetector:
             'DUST': (200, 150, 50),
         }
 
-        # Draw detections
         for det in output.detections:
             x1, y1, x2, y2 = det.bbox
             color = COLORS.get(det.class_name, (200,200,200))
             thickness = 3 if det.is_vru else 2
 
-            cv2.rectangle(vis, (x1,y1), (x2,y2),
-                          color, thickness)
+            cv2.rectangle(vis, (x1,y1), (x2,y2), color, thickness)
 
-            # Label: class + adj_confidence + distance
-            label = (f"{det.class_name} "
-                     f"{det.adj_confidence:.2f} "
-                     f"{det.est_distance_m}m")
+            label = f"{det.class_name} {det.adj_confidence:.2f} {det.est_distance_m}m"
+
             (tw, th), _ = cv2.getTextSize(
                 label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-            cv2.rectangle(vis,
-                          (x1, y1-th-8),
-                          (x1+tw+2, y1), color, -1)
-            cv2.putText(vis, label, (x1+1, y1-4),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.45, (0,0,0), 1)
 
-            # VRU indicator
+            cv2.rectangle(vis, (x1, y1-th-8), (x1+tw+2, y1), color, -1)
+
+            cv2.putText(vis, label, (x1+1, y1-4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0), 1)
+
             if det.is_vru:
                 cv2.putText(vis, "VRU",
                             (x1, y2+15),
                             cv2.FONT_HERSHEY_SIMPLEX,
                             0.4, (255, 50, 50), 2)
 
-        # Scene condition badge (top left)
         cond = output.scene.condition
         color = COND_COLORS.get(cond, (255,255,255))
-        badge = f"SCENE: {cond} ({output.scene.severity:.2f})"
-        cv2.rectangle(vis, (8, 8), (300, 35),
-                      (0, 0, 0), -1)
-        cv2.putText(vis, badge, (12, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, color, 2)
 
-        # Threshold badge
+        badge = f"SCENE: {cond} ({output.scene.severity:.2f})"
+
+        cv2.rectangle(vis, (8, 8), (300, 35), (0, 0, 0), -1)
+
+        cv2.putText(vis, badge, (12, 28),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
         thresh_txt = f"CONF THRESH: {output.scene.conf_threshold}"
-        cv2.rectangle(vis, (8, 38), (260, 62),
-                      (0, 0, 0), -1)
+
+        cv2.rectangle(vis, (8, 38), (260, 62), (0, 0, 0), -1)
+
         cv2.putText(vis, thresh_txt, (12, 57),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.55, (200, 200, 200), 1)
 
-        # Objects + latency (top right)
-        cv2.rectangle(vis, (w-200, 8), (w-5, 62),
-                      (0, 0, 0), -1)
+        cv2.rectangle(vis, (w-200, 8), (w-5, 62), (0, 0, 0), -1)
+
         cv2.putText(vis, f"Objects: {output.n_objects}",
                     (w-195, 28),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, (0, 255, 200), 2)
-        budget_col = ((0,255,0) if output.within_budget
-                      else (0,0,255))
+
+        budget_col = (0,255,0) if output.within_budget else (0,0,255)
+
         cv2.putText(vis,
-                    f"{output.processing_ms:.0f}ms "
-                    f"{'✓' if output.within_budget else '!'}",
+                    f"{output.processing_ms:.0f}ms {'✓' if output.within_budget else '!'}",
                     (w-195, 55),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.6, budget_col, 2)
 
-        # Bottom bar
-        cv2.rectangle(vis, (0, h-30), (w, h),
-                      (0, 0, 0), -1)
+        cv2.rectangle(vis, (0, h-30), (w, h), (0, 0, 0), -1)
+
         cv2.putText(vis,
-                    f"NeuroSentinel v3 | Frame {output.frame_id} "
-                    f"| YOLOv8s | Tata Technologies",
+                    f"NeuroSentinel v3 | Frame {output.frame_id} | YOLOv8s | Tata Technologies",
                     (10, h-10),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.45, (150, 150, 150), 1)
