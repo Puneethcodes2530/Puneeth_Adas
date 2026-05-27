@@ -391,7 +391,7 @@ class DepthEstimator:
         # Load ONNX model using OpenCV DNN
         # ====================================================
         self.net = cv2.dnn.readNet(
-            "models/midas_v21_384.onnx"
+            "models/model.onnx"
         )
 
         self.model_name = "MiDaS-ONNX"
@@ -434,7 +434,8 @@ class DepthEstimator:
         # ====================================================
         # Normalize to 0-1
         # ====================================================
-        img = img / 255.0
+        img = img.astype(np.float32) / 255.0
+        img = (img - 0.5) / 0.5
 
         # ====================================================
         # ImageNet normalization
@@ -506,7 +507,7 @@ class DepthEstimator:
         )
 
         # Remove batch/channel dimensions
-        depth = depth[0, 0]
+        depth = np.squeeze(depth)
 
         # ====================================================
         # DEPTH SMOOTHING

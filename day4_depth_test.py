@@ -10,33 +10,45 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.abspath('.'))
 
-from perception.depth_estimator import DepthEstimator
+from perception.depth_estimator_da import DepthEstimatorDA
 from perception.adaptive_detector import AdaptiveDetector
 from perception.clip_scene_detector import CLIPSceneDetector
 
+
 # ── PATHS ──────────────────────────────────────────────────
+
 BDD_PATH = r"C:\Users\PTT933267\Downloads\Puneeth_Adas\Datasets\BDD100k_Extracted\bdd100k\bdd100k\images\100k\test\f8284e36-08ff9271.jpg"
 
 IDD_PATH = r"C:\Users\PTT933267\Downloads\Puneeth_Adas\Datasets\IDD\22Gb IDD Detection(Main)\JPEGImages\highquality_16k\HYD-2018-04-26_12-40-01\0006527.jpg"
 
-# ── Validate image paths ───────────────────────────────────
-images = [BDD_PATH, IDD_PATH]
 
+# ── Validate image paths ───────────────────────────────────
+
+images = [BDD_PATH, IDD_PATH]
 
 if len(images) == 0:
     print("No valid images found.")
     exit()
 
+
 # ── Load models ────────────────────────────────────────────
+
 print("Loading models...")
-depth_est = DepthEstimator()
+
+depth_est = DepthEstimatorDA()
+
 detector = AdaptiveDetector('yolov8s.pt')
+
 clip_detector = CLIPSceneDetector()
 
+
 # ── Create output dir ──────────────────────────────────────
+
 os.makedirs("outputs", exist_ok=True)
 
+
 # ── Setup plotting ─────────────────────────────────────────
+
 fig, axes = plt.subplots(
     len(images),
     3,
@@ -54,7 +66,9 @@ fig.suptitle(
     color='white'
 )
 
+
 # ── Process images ─────────────────────────────────────────
+
 for idx, img_path in enumerate(images):
 
     print(f"\nProcessing: {os.path.basename(img_path)}")
@@ -65,35 +79,46 @@ for idx, img_path in enumerate(images):
         print(f"[ERROR] Failed to load image: {img_path}")
         continue
 
-    
+    # ── CLIP scene analysis ────────────────────────────────
+
     clip_condition, clip_conf = clip_detector.analyze(frame)
 
     print(f"[CLIP] {clip_condition} (conf: {clip_conf:.2f})")
 
-
     # ── Detection ──────────────────────────────────────────
+
     det_output = detector.process(frame)
+
     det_vis = detector.draw(frame, det_output)
 
     # ── Depth estimation ───────────────────────────────────
+
     depth_out = depth_est.estimate(frame)
-    depth_vis = depth_est.visualize(frame, depth_out)
+
+    depth_vis = depth_est.visualize(
+        frame,
+        depth_out
+    )
 
     # ── Combine detection + depth distances ───────────────
+
     det_with_depth = det_vis.copy()
 
     detection_summaries = []
 
     for det in det_output.detections:
 
-        
+        # Set class for geometry estimation
         depth_out.current_class = det.class_name
+
+        # ROI depth sampling
         depth_sample = depth_out.sample_at_bbox(det.bbox)
 
-
         real_dist = depth_sample['distance_m']
+
         confidence = depth_sample['confidence']
 
+        # Distance zone
         zone = (
             "NEAR" if real_dist < 10 else
             "MED" if real_dist < 30 else
@@ -120,7 +145,7 @@ for idx, img_path in enumerate(images):
             2
         )
 
-        # Console output (ONLY ONCE)
+        # Console output
         print(
             f"{det.class_name:<15} "
             f"{real_dist:>6.1f}m "
@@ -129,28 +154,34 @@ for idx, img_path in enumerate(images):
         )
 
     # ── Plotting ───────────────────────────────────────────
+
     row = axes[idx]
 
     # Detection
     row[0].imshow(cv2.cvtColor(det_vis, cv2.COLOR_BGR2RGB))
+
     row[0].set_title(
-        f'Detection | {det_output.scene.condition} | CLIP: {clip_condition}'
+        f'Detection | {det_output.scene.condition} | '
+        f'CLIP: {clip_condition} | '
         f'{det_output.n_objects} objects',
         color='white',
         fontsize=8
     )
+
     row[0].axis('off')
 
     # Depth map
     depth_right = depth_vis[:, depth_vis.shape[1] // 2:]
 
     row[1].imshow(cv2.cvtColor(depth_right, cv2.COLOR_BGR2RGB))
+
     row[1].set_title(
         f'Depth Map | {depth_out.model_name} | '
         f'{depth_out.processing_ms:.0f}ms',
         color='white',
         fontsize=8
     )
+
     row[1].axis('off')
 
     # Detection + distance
@@ -165,7 +196,9 @@ for idx, img_path in enumerate(images):
 
     row[2].axis('off')
 
+
 # ── Save figure ────────────────────────────────────────────
+
 plt.tight_layout()
 
 save_path = "outputs/phase3_depth_detection.png"
@@ -180,5 +213,7 @@ plt.savefig(
 plt.show()
 
 print(f"\n✓ Saved: {save_path}")
+
 print("\n🎯 Phase 3 Step 1 complete")
+
 print("Next: TTC Engine + Risk Scoring")
