@@ -16,8 +16,10 @@ sys.path.insert(0, os.path.dirname(
     os.path.dirname(os.path.abspath(__file__))))
 #__file__ shows the current file path and the abspath converts it into absolute path, next the os.path.dirname, moves it a level up and one more on the outside moves it even one more level up so pushing us to the root folder
 #The last sys.path.insert(0, ...) ensures to include this in the python import search path, for importing further files like below in future
-from perception.scene_detector import SceneState #We ONLY need SceneState now ✅
-from perception.clip_scene_detector import CLIPSceneDetector #CLIP imported ✅
+from perception.scene_analyzer import (
+    SceneState, #CLIP imported ✅
+    CLIPSceneDetector
+)
 
 
 @dataclass

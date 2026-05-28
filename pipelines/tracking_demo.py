@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.abspath('.'))
 
-from perception.phase4_tracker import (
+from perception.tracker import (
     Phase4TrackerPipeline
 )
 

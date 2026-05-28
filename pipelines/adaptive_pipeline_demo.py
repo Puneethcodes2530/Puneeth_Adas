@@ -10,7 +10,7 @@ import matplotlib.gridspec as gridspec
 import glob, os, sys, json
 
 sys.path.insert(0, os.path.abspath('.'))
-from perception.adaptive_detector import AdaptiveDetector
+from perception.detector import AdaptiveDetector
 
 # ── PATHS — update these ───────────────────────────────────
 PATHS = {

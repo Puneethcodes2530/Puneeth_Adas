@@ -36,8 +36,8 @@ sys.path.insert(
     )
 )
 
-from perception.adaptive_detector import AdaptiveDetector
-from perception.depth_estimator_da import DepthEstimatorDA
+from perception.detector import AdaptiveDetector
+from perception.depth_estimator import DepthEstimatorDA
 
 
 # ============================================================

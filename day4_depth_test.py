@@ -14,9 +14,9 @@ import matplotlib.pyplot as plt
 
 sys.path.insert(0, os.path.abspath('.'))
 
-from perception.depth_estimator_da import DepthEstimatorDA
-from perception.adaptive_detector import AdaptiveDetector
-from perception.clip_scene_detector import CLIPSceneDetector
+from perception.depth_estimator import DepthEstimatorDA
+from perception.detector import AdaptiveDetector
+from perception.scene_analyzer import CLIPSceneDetector
 
 
 # ── PATHS ──────────────────────────────────────────────────
