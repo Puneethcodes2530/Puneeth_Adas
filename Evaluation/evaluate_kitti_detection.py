@@ -1,5 +1,19 @@
 """
-NeuroSentinel v3 — KITTI Detection + Distance Evaluation
+NeuroSentinel v3 — KITTI Evaluation
+Geometry vs Geometry+Depth Fusion
+
+Evaluates:
+1. Detection performance
+2. Geometry-only distance estimation
+3. Geometry + depth fusion estimation
+
+Outputs:
+- MAE
+- RMSE
+- AbsRel
+- Improvement %
+- Scatter plots
+- JSON report
 """
 
 import cv2
@@ -8,17 +22,14 @@ import os
 import sys
 import glob
 import json
-import csv
 import time
-
 import matplotlib.pyplot as plt
-
-from collections import defaultdict
 from dataclasses import dataclass
+from collections import defaultdict
 
 
 # ============================================================
-# PROJECT IMPORTS
+# IMPORT PROJECT
 # ============================================================
 
 sys.path.insert(
@@ -53,13 +64,9 @@ IOU_THRESHOLD = 0.5
 class KITTILabel:
 
     obj_type: str
-
     bbox_2d: list
-
     z_3d: float
-
     truncated: float
-
     occluded: int
 
     @property
@@ -103,16 +110,12 @@ class KITTILabel:
 
 
 # ============================================================
-# PARSE KITTI LABEL FILE
+# PARSE LABELS
 # ============================================================
 
 def parse_kitti_label_file(label_path):
 
     labels = []
-
-    if not os.path.exists(label_path):
-
-        return labels
 
     with open(label_path, 'r') as f:
 
@@ -186,35 +189,188 @@ def compute_iou(box1, box2):
 
 
 # ============================================================
+# GEOMETRY DISTANCE
+# ============================================================
+
+def geometry_distance(det):
+
+    x1, y1, x2, y2 = det.bbox
+
+    bbox_h = y2 - y1
+    bbox_w = x2 - x1
+
+    effective_size = (
+
+        0.7 * bbox_h +
+
+        0.3 * bbox_w
+    )
+
+    REAL_HEIGHTS = {
+
+        'person': 1.7,
+
+        'car': 1.5,
+
+        'truck': 3.2,
+
+        'bus': 3.0,
+
+        'motorcycle': 1.2,
+
+        'bicycle': 1.1
+    }
+
+    real_h = REAL_HEIGHTS.get(
+        det.class_name,
+        1.7
+    )
+
+    FOCAL_LENGTH = 850
+
+    dist = (
+        FOCAL_LENGTH * real_h
+    ) / max(effective_size, 1)
+
+    return dist
+
+
+# ============================================================
+# DEPTH FUSION
+# ============================================================
+
+def fusion_distance(det, depth_out):
+
+    geom_dist = geometry_distance(det)
+
+    x1, y1, x2, y2 = map(int, det.bbox)
+
+    h, w = depth_out.depth_map.shape
+
+    x1 = max(0, min(x1, w - 1))
+    x2 = max(0, min(x2, w - 1))
+
+    y1 = max(0, min(y1, h - 1))
+    y2 = max(0, min(y2, h - 1))
+
+    if x2 <= x1 or y2 <= y1:
+        return geom_dist
+
+    # --------------------------------------------------------
+    # FOOT ROI
+    # --------------------------------------------------------
+
+    foot_y = y2
+
+    y_start = max(
+        foot_y - 12,
+        0
+    )
+
+    roi = depth_out.depth_map[
+        y_start:foot_y,
+        x1:x2
+    ]
+
+    if roi.size == 0:
+        return geom_dist
+
+    # --------------------------------------------------------
+    # DEPTH STABILITY
+    # --------------------------------------------------------
+
+    depth_mean = float(
+        np.mean(roi)
+    )
+
+    depth_std = float(
+        np.std(roi)
+    )
+
+    stability = 1.0 - min(
+        1.0,
+        depth_std / (depth_mean + 1e-6)
+    )
+
+    # --------------------------------------------------------
+    # RELATIVE DEPTH
+    # --------------------------------------------------------
+
+    raw_depth = float(
+        np.percentile(roi, 20)
+    )
+
+    raw_depth = max(raw_depth, 0.05)
+
+    # --------------------------------------------------------
+    # SMALL CORRECTION
+    # --------------------------------------------------------
+
+    correction = 1.0 + (
+        (0.5 - raw_depth) * 0.25
+    )
+
+    correction = np.clip(
+        correction,
+        0.85,
+        1.15
+    )
+
+    depth_adjusted = (
+        geom_dist * correction
+    )
+
+    # --------------------------------------------------------
+    # CONFIDENCE WEIGHTED FUSION
+    # --------------------------------------------------------
+
+    fusion_weight = 0.15 * stability
+
+    final_dist = (
+
+        (1 - fusion_weight) * geom_dist +
+
+        fusion_weight * depth_adjusted
+    )
+
+    final_dist = np.clip(
+        final_dist,
+        1.0,
+        120.0
+    )
+
+    return float(final_dist)
+
+
+# ============================================================
 # DISTANCE METRICS
 # ============================================================
 
-def compute_metrics(gt, pred):
+def compute_distance_metrics(gt, pred):
 
     gt = np.array(gt)
     pred = np.array(pred)
 
     if len(gt) == 0:
+        return {}
 
-        return None
-
-    # Scale alignment
+    # scale alignment
     scale = np.median(gt) / (
         np.median(pred) + 1e-6
     )
 
-    pred = pred * scale
+    pred_scaled = pred * scale
 
     mae = np.mean(
-        np.abs(pred - gt)
+        np.abs(pred_scaled - gt)
     )
 
     rmse = np.sqrt(
-        np.mean((pred - gt) ** 2)
+        np.mean((pred_scaled - gt) ** 2)
     )
 
     abs_rel = np.mean(
-        np.abs(pred - gt) / gt
+        np.abs(pred_scaled - gt) / gt
     )
 
     return {
@@ -233,15 +389,11 @@ def compute_metrics(gt, pred):
 # MAIN
 # ============================================================
 
-def run():
+def run_evaluation():
 
     print("=" * 60)
     print("NeuroSentinel v3 — KITTI Evaluation")
     print("=" * 60)
-
-    # --------------------------------------------------------
-    # PATHS
-    # --------------------------------------------------------
 
     image_dir = os.path.join(
 
@@ -265,11 +417,13 @@ def run():
         "label_2"
     )
 
-    # --------------------------------------------------------
-    # LOAD MODELS
-    # --------------------------------------------------------
+    image_files = sorted(
+        glob.glob(
+            os.path.join(image_dir, "*.png")
+        )
+    )[:MAX_IMAGES]
 
-    print("\nLoading models...")
+    print("Loading models...")
 
     detector = AdaptiveDetector(
         'yolov8s.pt'
@@ -279,60 +433,49 @@ def run():
 
     print("✓ Models loaded")
 
-    # --------------------------------------------------------
-    # GET IMAGES
-    # --------------------------------------------------------
+    # ========================================================
+    # STORAGE
+    # ========================================================
 
-    image_files = sorted(
+    all_gt_dist = []
 
-        glob.glob(
-            os.path.join(
-                image_dir,
-                "*.png"
-            )
-        )
-    )
+    all_geom_dist = []
 
-    image_files = image_files[:MAX_IMAGES]
+    all_fusion_dist = []
 
-    print(f"\nEvaluating on {len(image_files)} images")
+    latencies = []
 
-    # --------------------------------------------------------
-    # RESULTS STORAGE
-    # --------------------------------------------------------
-
-    gt_all = []
-    pred_all = []
-
-    class_stats = defaultdict(
+    class_results = defaultdict(
         lambda: {
+
             'tp': 0,
+
             'fp': 0,
+
             'fn': 0
         }
     )
 
-    latencies = []
+    print(f"Evaluating on {len(image_files)} images")
 
-    # --------------------------------------------------------
-    # PROCESS
-    # --------------------------------------------------------
+    # ========================================================
+    # LOOP
+    # ========================================================
 
-    for idx, img_path in enumerate(image_files):
+    for idx, image_path in enumerate(image_files):
 
-        img_name = os.path.splitext(
-            os.path.basename(img_path)
-        )[0]
+        image_id = os.path.basename(
+            image_path
+        ).replace(".png", "")
 
         label_path = os.path.join(
+
             label_dir,
-            img_name + ".txt"
+
+            image_id + ".txt"
         )
 
-        frame = cv2.imread(img_path)
-
-        if frame is None:
-            continue
+        frame = cv2.imread(image_path)
 
         gt_labels = [
 
@@ -343,33 +486,28 @@ def run():
         ]
 
         # ----------------------------------------------------
-        # DETECTION
+        # PIPELINE
         # ----------------------------------------------------
 
-        t0 = time.time()
+        start = time.time()
 
         det_output = detector.process(frame)
 
-        latency_ms = (
-            time.time() - t0
-        ) * 1000
-
-        latencies.append(latency_ms)
-
-        # ----------------------------------------------------
-        # DEPTH
-        # ----------------------------------------------------
-
         depth_out = depth_estimator.estimate(frame)
 
+        latency = (
+            time.time() - start
+        ) * 1000
+
+        latencies.append(latency)
+
         # ----------------------------------------------------
-        # MATCH GT ↔ PRED
+        # MATCHING
         # ----------------------------------------------------
 
-        matched_gt = set()
         matched_pred = set()
 
-        for gt_idx, gt in enumerate(gt_labels):
+        for gt in gt_labels:
 
             best_iou = IOU_THRESHOLD
             best_det = None
@@ -385,9 +523,7 @@ def run():
                     continue
 
                 iou = compute_iou(
-
                     gt.bbox_2d,
-
                     det.bbox
                 )
 
@@ -402,33 +538,42 @@ def run():
 
             if best_det is not None:
 
-                matched_gt.add(gt_idx)
                 matched_pred.add(best_det)
 
-                det = det_output.detections[best_det]
-
-                # --------------------------------------------
-                # DISTANCE ESTIMATION
-                # --------------------------------------------
-
-                depth_out.current_class = det.class_name
-
-                sample = depth_out.sample_at_bbox(
-                    det.bbox
-                )
-
-                pred_dist = sample['distance_m']
+                det = det_output.detections[
+                    best_det
+                ]
 
                 gt_dist = gt.z_3d
 
-                gt_all.append(gt_dist)
-                pred_all.append(pred_dist)
+                geom_dist = geometry_distance(
+                    det
+                )
 
-                class_stats[gt.adas_class]['tp'] += 1
+                fusion_dist = fusion_distance(
+                    det,
+                    depth_out
+                )
+
+                # --------------------------------------------
+                # STORE
+                # --------------------------------------------
+
+                all_gt_dist.append(gt_dist)
+
+                all_geom_dist.append(geom_dist)
+
+                all_fusion_dist.append(fusion_dist)
+
+                class_results[
+                    det.class_name
+                ]['tp'] += 1
 
             else:
 
-                class_stats[gt.adas_class]['fn'] += 1
+                class_results[
+                    gt.adas_class
+                ]['fn'] += 1
 
         # ----------------------------------------------------
         # FALSE POSITIVES
@@ -440,40 +585,42 @@ def run():
 
             if det_idx not in matched_pred:
 
-                class_stats[det.class_name]['fp'] += 1
+                class_results[
+                    det.class_name
+                ]['fp'] += 1
 
         print(
 
             f"[{idx+1}/{len(image_files)}] "
 
-            f"{img_name} | "
+            f"{image_id} "
 
-            f"GT:{len(gt_labels)} | "
+            f"| GT:{len(gt_labels)} "
 
-            f"Pred:{len(det_output.detections)} | "
+            f"| Pred:{len(det_output.detections)} "
 
-            f"Latency:{latency_ms:.0f}ms"
+            f"| Latency:{latency:.0f}ms"
         )
 
     # ========================================================
     # METRICS
     # ========================================================
 
-    print("\n" + "=" * 60)
+    print("=" * 60)
     print("FINAL RESULTS")
     print("=" * 60)
 
     # --------------------------------------------------------
-    # DETECTION METRICS
+    # DETECTION
     # --------------------------------------------------------
 
-    print("\nDetection Metrics:\n")
+    print("Detection Metrics:")
 
-    for cls, stats in class_stats.items():
+    for cls, r in class_results.items():
 
-        tp = stats['tp']
-        fp = stats['fp']
-        fn = stats['fn']
+        tp = r['tp']
+        fp = r['fp']
+        fn = r['fn']
 
         precision = tp / (tp + fp + 1e-6)
 
@@ -498,44 +645,95 @@ def run():
         )
 
     # --------------------------------------------------------
-    # DISTANCE METRICS
+    # GEOMETRY
     # --------------------------------------------------------
 
-    metrics = compute_metrics(
-        gt_all,
-        pred_all
+    geom_metrics = compute_distance_metrics(
+
+        all_gt_dist,
+
+        all_geom_dist
     )
 
-    print("\nDistance Metrics:\n")
+    # --------------------------------------------------------
+    # FUSION
+    # --------------------------------------------------------
 
-    if metrics:
+    fusion_metrics = compute_distance_metrics(
 
-        for k, v in metrics.items():
+        all_gt_dist,
 
-            print(f"{k:<15}: {v}")
+        all_fusion_dist
+    )
+
+    # --------------------------------------------------------
+    # PRINT
+    # --------------------------------------------------------
+
+    print("\n" + "=" * 60)
+    print("DISTANCE ESTIMATION COMPARISON")
+    print("=" * 60)
+
+    print("\nGeometry Only:")
+
+    for k, v in geom_metrics.items():
+
+        print(f"{k:<15}: {v}")
+
+    print("\nGeometry + Depth Fusion:")
+
+    for k, v in fusion_metrics.items():
+
+        print(f"{k:<15}: {v}")
+
+    # --------------------------------------------------------
+    # IMPROVEMENT
+    # --------------------------------------------------------
+
+    geom_mae = geom_metrics['MAE_m']
+
+    fusion_mae = fusion_metrics['MAE_m']
+
+    improvement = (
+
+        (geom_mae - fusion_mae)
+
+        / geom_mae
+
+    ) * 100
+
+    print("\n" + "=" * 60)
+
+    print(
+        f"Fusion improved MAE by "
+        f"{improvement:.2f}%"
+    )
+
+    print("=" * 60)
 
     # --------------------------------------------------------
     # LATENCY
     # --------------------------------------------------------
 
-    print("\nLatency:\n")
+    mean_latency = np.mean(
+        latencies
+    )
+
+    fps = 1000 / mean_latency
+
+    print("\nLatency:")
 
     print(
-
         f"Mean latency: "
-
-        f"{np.mean(latencies):.1f}ms"
+        f"{mean_latency:.1f}ms"
     )
 
     print(
-
-        f"FPS: "
-
-        f"{1000/np.mean(latencies):.2f}"
+        f"FPS: {fps:.2f}"
     )
 
     # ========================================================
-    # SAVE RESULTS
+    # SAVE JSON
     # ========================================================
 
     os.makedirs(
@@ -543,98 +741,141 @@ def run():
         exist_ok=True
     )
 
-    # --------------------------------------------------------
-    # SAVE JSON
-    # --------------------------------------------------------
+    results = {
 
-    report = {
+        "geometry_metrics":
+            geom_metrics,
 
-        'distance_metrics': metrics,
+        "fusion_metrics":
+            fusion_metrics,
 
-        'mean_latency_ms': float(
-            np.mean(latencies)
-        ),
+        "fusion_improvement_percent":
+            round(improvement, 2),
 
-        'fps': float(
-            1000 / np.mean(latencies)
-        )
+        "mean_latency_ms":
+            float(mean_latency),
+
+        "fps":
+            float(fps)
     }
 
     with open(
 
-        "outputs/evaluation/kitti_results.json",
+        "outputs/evaluation/results.json",
 
-        'w'
+        "w"
     ) as f:
 
         json.dump(
-            report,
+            results,
             f,
             indent=2
         )
 
+    # ========================================================
+    # SCATTER PLOTS
+    # ========================================================
+
+    gt = np.array(all_gt_dist)
+
+    geom = np.array(all_geom_dist)
+
+    fusion = np.array(all_fusion_dist)
+
+    geom_scale = np.median(gt) / (
+        np.median(geom) + 1e-6
+    )
+
+    fusion_scale = np.median(gt) / (
+        np.median(fusion) + 1e-6
+    )
+
+    geom = geom * geom_scale
+
+    fusion = fusion * fusion_scale
+
     # --------------------------------------------------------
-    # SCATTER PLOT
+    # PLOT
     # --------------------------------------------------------
 
-    if len(gt_all) > 0:
+    fig, axes = plt.subplots(
+        1,
+        2,
+        figsize=(14, 6)
+    )
 
-        gt = np.array(gt_all)
-        pred = np.array(pred_all)
+    # --------------------------------------------------------
+    # GEOMETRY
+    # --------------------------------------------------------
 
-        scale = np.median(gt) / (
-            np.median(pred) + 1e-6
-        )
+    axes[0].scatter(
+        gt,
+        geom,
+        alpha=0.6
+    )
 
-        pred = pred * scale
+    axes[0].plot(
+        [0, max(gt)],
+        [0, max(gt)],
+        'r--'
+    )
 
-        plt.figure(figsize=(8, 8))
+    axes[0].set_title(
+        "Geometry Only"
+    )
 
-        plt.scatter(
-            gt,
-            pred,
-            alpha=0.5
-        )
+    axes[0].set_xlabel(
+        "GT Distance (m)"
+    )
 
-        max_d = max(
-            gt.max(),
-            pred.max()
-        )
+    axes[0].set_ylabel(
+        "Predicted Distance (m)"
+    )
 
-        plt.plot(
+    # --------------------------------------------------------
+    # FUSION
+    # --------------------------------------------------------
 
-            [0, max_d],
+    axes[1].scatter(
+        gt,
+        fusion,
+        alpha=0.6
+    )
 
-            [0, max_d],
+    axes[1].plot(
+        [0, max(gt)],
+        [0, max(gt)],
+        'r--'
+    )
 
-            'r--'
-        )
+    axes[1].set_title(
+        "Geometry + Depth Fusion"
+    )
 
-        plt.xlabel("GT Distance (m)")
-        plt.ylabel("Predicted Distance (m)")
+    axes[1].set_xlabel(
+        "GT Distance (m)"
+    )
 
-        plt.title(
-            "KITTI Distance Evaluation"
-        )
+    axes[1].set_ylabel(
+        "Predicted Distance (m)"
+    )
 
-        plt.grid(True)
+    plt.tight_layout()
 
-        plt.savefig(
+    plt.savefig(
 
-            "outputs/evaluation/"
-            "distance_scatter.png",
+        "outputs/evaluation/comparison.png",
 
-            dpi=150
-        )
+        dpi=150
+    )
 
-        plt.close()
+    plt.show()
 
     print("\n✓ Evaluation Complete")
 
-    print(
-        "\nSaved to:"
-        "\noutputs/evaluation/"
-    )
+    print("Saved to:")
+
+    print("outputs/evaluation/")
 
 
 # ============================================================
@@ -643,4 +884,4 @@ def run():
 
 if __name__ == "__main__":
 
-    run()
+    run_evaluation()
