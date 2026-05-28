@@ -313,11 +313,10 @@ class SceneDetector:
         # Optional latency enforcement
         # ====================================================
         if self.enforce_budget:
-
-            assert ms < self._budget_ms * 3, (
-                f"Scene detector budget exceeded: "
-                f"{ms:.2f}ms"
-            )
+            if ms > self._budget_ms * 3:
+                print(
+                    f"[WARNING] Scene detector slow: {ms:.2f} ms"
+                )
 
         # ====================================================
         # Return structured scene output

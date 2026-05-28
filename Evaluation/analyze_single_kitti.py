@@ -49,7 +49,7 @@ KITTI_ROOT = r"C:\Users\PTT933267\Downloads\Puneeth_Adas\Datasets\KITTI"
 # CHANGE THIS IMAGE ID
 IMAGE_ID = "007069"
 
-IOU_THRESHOLD = 0.3
+IOU_THRESHOLD = 0.5
 
 
 # ============================================================
