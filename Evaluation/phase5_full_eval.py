@@ -7,9 +7,12 @@ Evaluates:
 3. Visual sample outputs with tracking, distance, TTC and risk
 
 Outputs:
-- phase5_report.png
-- phase5_report.json
-- visual_samples/*.png
+- outputs/reports/phase5_report.png
+- outputs/reports/phase5_report.json
+- outputs/reports/visual_samples/*.png
+
+How to run:
+python Evaluation/phase5_full_eval.py
 """
 
 import cv2
@@ -19,9 +22,12 @@ import os
 import sys
 import json
 import time
+import torch
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+
 from collections import defaultdict
+from ultralytics import YOLO
 
 
 # =========================================================
@@ -34,24 +40,24 @@ ROOT = os.path.abspath(
     )
 )
 
-sys.path.insert(0, ROOT)
+sys.path.insert(
+    0,
+    ROOT
+)
 
 print("Project root:", ROOT)
 
 
 # =========================================================
-# IMPORTS
+# IMPORT PROJECT MODULES
 # =========================================================
-
-from ultralytics import YOLO
 
 from perception.tracker import Phase4TrackerPipeline
 from perception.depth_estimator import DepthEstimatorDA
 
 
-
 # =========================================================
-# PATHS
+# PATHS — CHANGE ONLY THESE IF NEEDED
 # =========================================================
 
 BDD_PATH = r"C:\Users\PTT933267\Downloads\Puneeth_Adas\Datasets\BDD100k_Extracted\bdd100k\bdd100k\images\100k\test"
@@ -60,15 +66,94 @@ KITTI_IMG = r"C:\Users\PTT933267\Downloads\Puneeth_Adas\Datasets\KITTI\data_obje
 
 KITTI_LBL = r"C:\Users\PTT933267\Downloads\Puneeth_Adas\Datasets\KITTI\data_object_label_2\training\label_2"
 
+
+# =========================================================
+# CONFIG
+# =========================================================
+
 N_IMAGES = 100
 N_LATENCY_IMAGES = 10
 N_VISUAL_SAMPLES = 5
 
-OUTPUT_DIR = os.path.join(ROOT, "outputs", "reports")
-VIS_DIR = os.path.join(OUTPUT_DIR, "visual_samples")
+IOU_THRESHOLD = 0.5
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
-os.makedirs(VIS_DIR, exist_ok=True)
+# Stable demo/eval settings
+PIPE_MODEL_WEIGHTS = "yolov8s.pt"
+PIPE_IMGSZ = 640
+PIPE_CONF = 0.35
+
+# Detection metric model
+# Use yolov8s for speed, yolov8x for stronger accuracy.
+DET_MODEL_WEIGHTS = "yolov8s.pt"
+DET_CONF = 0.30
+
+DEVICE = 0 if torch.cuda.is_available() else "cpu"
+
+OUTPUT_DIR = os.path.join(
+    ROOT,
+    "outputs",
+    "reports"
+)
+
+VIS_DIR = os.path.join(
+    OUTPUT_DIR,
+    "visual_samples"
+)
+
+os.makedirs(
+    OUTPUT_DIR,
+    exist_ok=True
+)
+
+os.makedirs(
+    VIS_DIR,
+    exist_ok=True
+)
+
+
+# =========================================================
+# IMAGE SEARCH
+# =========================================================
+
+def find_images(
+    folder,
+    limit,
+    exts=(".jpg", ".jpeg", ".png")
+):
+    """
+    Recursively finds images inside a folder.
+    """
+
+    if not os.path.exists(folder):
+
+        print(
+            f"[WARNING] Folder does not exist: {folder}"
+        )
+
+        return []
+
+    files = []
+
+    for ext in exts:
+
+        files.extend(
+            glob.glob(
+                os.path.join(folder, f"*{ext}")
+            )
+        )
+
+        files.extend(
+            glob.glob(
+                os.path.join(folder, "**", f"*{ext}"),
+                recursive=True
+            )
+        )
+
+    files = sorted(
+        list(set(files))
+    )
+
+    return files[:limit]
 
 
 # =========================================================
@@ -76,6 +161,7 @@ os.makedirs(VIS_DIR, exist_ok=True)
 # =========================================================
 
 print("[INFO] Loading Depth Engine...")
+
 depth_engine = DepthEstimatorDA()
 
 
@@ -84,7 +170,11 @@ def my_depth_fn(frame):
     Function passed into Phase4TrackerPipeline.
     It returns only the depth map.
     """
-    depth_output = depth_engine.estimate(frame)
+
+    depth_output = depth_engine.estimate(
+        frame
+    )
+
     return depth_output.depth_map
 
 
@@ -95,7 +185,12 @@ def my_depth_fn(frame):
 print("[INFO] Loading Phase 4 pipeline...")
 
 pipe = Phase4TrackerPipeline(
-    depth_fn=my_depth_fn
+    model_weights=PIPE_MODEL_WEIGHTS,
+    depth_fn=my_depth_fn,
+    fps=30,
+    imgsz=PIPE_IMGSZ,
+    conf=PIPE_CONF,
+    use_tracker=True
 )
 
 print("[INFO] Phase 4 pipeline loaded.")
@@ -119,17 +214,32 @@ def iou(a, b):
     x2 = min(a[2], b[2])
     y2 = min(a[3], b[3])
 
-    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    inter = max(
+        0,
+        x2 - x1
+    ) * max(
+        0,
+        y2 - y1
+    )
 
     if inter <= 0:
         return 0.0
 
-    area_a = (a[2] - a[0]) * (a[3] - a[1])
-    area_b = (b[2] - b[0]) * (b[3] - b[1])
+    area_a = (
+        (a[2] - a[0]) *
+        (a[3] - a[1])
+    )
+
+    area_b = (
+        (b[2] - b[0]) *
+        (b[3] - b[1])
+    )
 
     union = area_a + area_b - inter
 
-    return inter / (union + 1e-6)
+    return inter / (
+        union + 1e-6
+    )
 
 
 # =========================================================
@@ -173,16 +283,26 @@ def parse_kitti_label(path):
             if p[0] == "DontCare":
                 continue
 
-            cls = class_map.get(p[0])
+            cls = class_map.get(
+                p[0]
+            )
 
             if cls is None:
                 continue
 
-            truncated = float(p[1])
-            occluded = int(p[2])
-            z_3d = float(p[13])
+            truncated = float(
+                p[1]
+            )
 
-            # Same fair filtering logic
+            occluded = int(
+                p[2]
+            )
+
+            z_3d = float(
+                p[13]
+            )
+
+            # Fair filtering
             if truncated >= 0.5:
                 continue
 
@@ -192,16 +312,18 @@ def parse_kitti_label(path):
             if z_3d <= 0 or z_3d >= 80:
                 continue
 
-            objs.append({
-                "class": cls,
-                "bbox": [
-                    float(p[4]),
-                    float(p[5]),
-                    float(p[6]),
-                    float(p[7])
-                ],
-                "distance_m": z_3d
-            })
+            objs.append(
+                {
+                    "class": cls,
+                    "bbox": [
+                        float(p[4]),
+                        float(p[5]),
+                        float(p[6]),
+                        float(p[7])
+                    ],
+                    "distance_m": z_3d
+                }
+            )
 
     return objs
 
@@ -216,15 +338,40 @@ def run_detection_eval():
     print("Running KITTI Detection Evaluation")
     print("================================================")
 
-    model = YOLO("yolov8x.pt")
+    if not os.path.exists(KITTI_IMG):
+
+        print(
+            "[ERROR] KITTI image path not found:",
+            KITTI_IMG
+        )
+
+        return {}
+
+    if not os.path.exists(KITTI_LBL):
+
+        print(
+            "[ERROR] KITTI label path not found:",
+            KITTI_LBL
+        )
+
+        return {}
+
+    model = YOLO(
+        DET_MODEL_WEIGHTS
+    )
 
     img_files = sorted(
-        glob.glob(os.path.join(KITTI_IMG, "*.png"))
+        glob.glob(
+            os.path.join(
+                KITTI_IMG,
+                "*.png"
+            )
+        )
     )[:N_IMAGES]
 
     if len(img_files) == 0:
+
         print("[ERROR] No KITTI images found.")
-        print("Check KITTI_IMG path:", KITTI_IMG)
         return {}
 
     stats = defaultdict(
@@ -237,7 +384,9 @@ def run_detection_eval():
 
     for idx, img_path in enumerate(img_files):
 
-        frame = cv2.imread(img_path)
+        frame = cv2.imread(
+            img_path
+        )
 
         if frame is None:
             continue
@@ -251,12 +400,15 @@ def run_detection_eval():
             name + ".txt"
         )
 
-        gt_objs = parse_kitti_label(gt_path)
+        gt_objs = parse_kitti_label(
+            gt_path
+        )
 
         results = model(
             frame,
-            conf=0.30,
-            verbose=False
+            conf=DET_CONF,
+            verbose=False,
+            device=DEVICE
         )
 
         preds = results[0].boxes
@@ -268,7 +420,7 @@ def run_detection_eval():
         # ---------------------------------------------
         for gt in gt_objs:
 
-            best_iou = 0.5
+            best_iou = IOU_THRESHOLD
             best_idx = None
 
             for p_i in range(len(preds)):
@@ -291,17 +443,25 @@ def run_detection_eval():
                 )
 
                 if score > best_iou:
+
                     best_iou = score
                     best_idx = p_i
 
             if best_idx is not None:
 
-                matched_pred.add(best_idx)
-                stats[gt["class"]]["tp"] += 1
+                matched_pred.add(
+                    best_idx
+                )
+
+                stats[
+                    gt["class"]
+                ]["tp"] += 1
 
             else:
 
-                stats[gt["class"]]["fn"] += 1
+                stats[
+                    gt["class"]
+                ]["fn"] += 1
 
         # ---------------------------------------------
         # Count false positives
@@ -315,10 +475,23 @@ def run_detection_eval():
                 int(preds.cls[p_i])
             ]
 
-            if pred_cls in ["person", "bicycle", "car", "motorcycle", "bus", "truck"]:
-                stats[pred_cls]["fp"] += 1
+            if pred_cls in [
+                "person",
+                "bicycle",
+                "car",
+                "motorcycle",
+                "bus",
+                "truck"
+            ]:
 
-        print(f"[{idx + 1}/{len(img_files)}] {name}")
+                stats[
+                    pred_cls
+                ]["fp"] += 1
+
+        print(
+            f"[{idx + 1:03d}/{len(img_files)}] "
+            f"{name}"
+        )
 
     # ---------------------------------------------
     # Compute metrics
@@ -335,8 +508,13 @@ def run_detection_eval():
         fp = s["fp"]
         fn = s["fn"]
 
-        precision = tp / (tp + fp + 1e-6)
-        recall = tp / (tp + fn + 1e-6)
+        precision = tp / (
+            tp + fp + 1e-6
+        )
+
+        recall = tp / (
+            tp + fn + 1e-6
+        )
 
         f1 = (
             2 * precision * recall /
@@ -373,26 +551,33 @@ def run_latency():
     print("Running End-to-End Latency Benchmark")
     print("================================================")
 
-    imgs = sorted(
-        glob.glob(os.path.join(BDD_PATH, "*.jpg"))
-    )[:N_LATENCY_IMAGES]
+    imgs = find_images(
+        BDD_PATH,
+        limit=N_LATENCY_IMAGES
+    )
 
     if len(imgs) == 0:
-        print("[WARNING] No BDD images found. Trying PNG fallback...")
 
-        imgs = sorted(
-            glob.glob(os.path.join(BDD_PATH, "*.png"))
-        )[:N_LATENCY_IMAGES]
+        print(
+            "[WARNING] No BDD images found. "
+            "Using KITTI fallback."
+        )
+
+        imgs = find_images(
+            KITTI_IMG,
+            limit=N_LATENCY_IMAGES,
+            exts=(".png", ".jpg", ".jpeg")
+        )
 
     if len(imgs) == 0:
+
         print("[ERROR] No images found for latency benchmark.")
-        print("Check BDD_PATH:", BDD_PATH)
 
         return {
-            "p50": 0,
-            "p90": 0,
-            "p99": 0,
-            "mean": 0,
+            "p50_ms": 0,
+            "p90_ms": 0,
+            "p99_ms": 0,
+            "mean_ms": 0,
             "fps": 0
         }
 
@@ -400,33 +585,51 @@ def run_latency():
 
     for idx, img_path in enumerate(imgs):
 
-        frame = cv2.imread(img_path)
+        frame = cv2.imread(
+            img_path
+        )
 
         if frame is None:
             continue
 
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+
         t = time.perf_counter()
 
-        objects, depth_map, latency = pipe.process(frame)
+        objects, depth_map, latency = pipe.process(
+            frame
+        )
 
-        ms = (time.perf_counter() - t) * 1000
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
 
-        latencies.append(ms)
+        ms = (
+            time.perf_counter() -
+            t
+        ) * 1000
+
+        latencies.append(
+            ms
+        )
 
         print(
-            f"[{idx + 1}/{len(imgs)}] "
-            f"{os.path.basename(img_path)} "
+            f"[{idx + 1:03d}/{len(imgs)}] "
+            f"{os.path.basename(img_path)[:35]:<35} "
             f"{ms:.0f}ms | objects={len(objects)}"
         )
 
-    arr = np.array(latencies)
+    arr = np.array(
+        latencies
+    )
 
     if len(arr) == 0:
+
         return {
-            "p50": 0,
-            "p90": 0,
-            "p99": 0,
-            "mean": 0,
+            "p50_ms": 0,
+            "p90_ms": 0,
+            "p99_ms": 0,
+            "mean_ms": 0,
             "fps": 0
         }
 
@@ -443,9 +646,69 @@ def run_latency():
     print("================================================")
 
     for k, v in result.items():
-        print(f"{k:<12}: {v}")
+
+        print(
+            f"{k:<12}: {v}"
+        )
 
     return result
+
+
+# =========================================================
+# DEPTH VISUALIZATION
+# =========================================================
+
+def make_depth_vis(
+    depth_map,
+    target_shape
+):
+
+    h, w = target_shape[:2]
+
+    if depth_map is None:
+
+        blank = np.zeros(
+            (h, w, 3),
+            dtype=np.uint8
+        )
+
+        cv2.putText(
+            blank,
+            "No depth map",
+            (30, 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+        return blank
+
+    d = depth_map.copy()
+
+    d = (
+        (d - d.min()) /
+        (d.max() - d.min() + 1e-6)
+    )
+
+    d = (
+        d * 255
+    ).astype(np.uint8)
+
+    depth_color = cv2.applyColorMap(
+        d,
+        cv2.COLORMAP_MAGMA
+    )
+
+    if depth_color.shape[:2] != (h, w):
+
+        depth_color = cv2.resize(
+            depth_color,
+            (w, h)
+        )
+
+    return depth_color
 
 
 # =========================================================
@@ -458,17 +721,21 @@ def visualize_samples():
     print("Generating Visual Samples")
     print("================================================")
 
-    img_files = sorted(
-        glob.glob(os.path.join(BDD_PATH, "*.jpg"))
-    )[:N_VISUAL_SAMPLES]
+    img_files = find_images(
+        BDD_PATH,
+        limit=N_VISUAL_SAMPLES
+    )
 
     if len(img_files) == 0:
 
-        img_files = sorted(
-            glob.glob(os.path.join(KITTI_IMG, "*.png"))
-        )[:N_VISUAL_SAMPLES]
+        img_files = find_images(
+            KITTI_IMG,
+            limit=N_VISUAL_SAMPLES,
+            exts=(".png", ".jpg", ".jpeg")
+        )
 
     if len(img_files) == 0:
+
         print("[ERROR] No images found for visualization.")
         return []
 
@@ -476,12 +743,16 @@ def visualize_samples():
 
     for idx, img_path in enumerate(img_files):
 
-        frame = cv2.imread(img_path)
+        frame = cv2.imread(
+            img_path
+        )
 
         if frame is None:
             continue
 
-        objects, depth_map, latency = pipe.process(frame)
+        objects, depth_map, latency = pipe.process(
+            frame
+        )
 
         vis = pipe.draw(
             frame,
@@ -489,52 +760,34 @@ def visualize_samples():
             latency
         )
 
-        # ---------------------------------------------
-        # Depth visualization
-        # ---------------------------------------------
-        if depth_map is not None:
+        depth_color = make_depth_vis(
+            depth_map,
+            frame.shape
+        )
 
-            d = depth_map.copy()
-
-            d = (
-                (d - d.min()) /
-                (d.max() - d.min() + 1e-6)
-            )
-
-            d = (d * 255).astype(np.uint8)
-
-            depth_color = cv2.applyColorMap(
-                d,
-                cv2.COLORMAP_MAGMA
-            )
-
-            if depth_color.shape[:2] != vis.shape[:2]:
-                depth_color = cv2.resize(
-                    depth_color,
-                    (vis.shape[1], vis.shape[0])
-                )
-
-            combined = np.hstack([
+        combined = np.hstack(
+            [
                 vis,
                 depth_color
-            ])
-
-        else:
-
-            combined = vis
+            ]
+        )
 
         save_path = os.path.join(
             VIS_DIR,
-            f"sample_{idx + 1}_{os.path.basename(img_path)}"
+            f"sample_{idx + 1}_{os.path.splitext(os.path.basename(img_path))[0]}.png"
         )
 
-        cv2.imwrite(save_path, combined)
+        cv2.imwrite(
+            save_path,
+            combined
+        )
 
-        saved_paths.append(save_path)
+        saved_paths.append(
+            save_path
+        )
 
         print(
-            f"Saved visual sample {idx + 1}: "
-            f"{save_path}"
+            f"Saved visual sample {idx + 1}: {save_path}"
         )
 
     return saved_paths
@@ -555,30 +808,62 @@ def plot_report(det, lat):
         facecolor="#0a0a1a"
     )
 
-    gs = gridspec.GridSpec(1, 2)
+    gs = gridspec.GridSpec(
+        1,
+        2
+    )
 
-    ax1 = fig.add_subplot(gs[0, 0])
-    ax2 = fig.add_subplot(gs[0, 1])
+    ax1 = fig.add_subplot(
+        gs[0, 0]
+    )
 
-    ax1.set_facecolor("#111122")
-    ax2.set_facecolor("#111122")
+    ax2 = fig.add_subplot(
+        gs[0, 1]
+    )
+
+    ax1.set_facecolor(
+        "#111122"
+    )
+
+    ax2.set_facecolor(
+        "#111122"
+    )
 
     # ---------------------------------------------
     # Detection chart
     # ---------------------------------------------
-    classes = list(det.keys())
+    classes = list(
+        det.keys()
+    )
 
     if len(classes) == 0:
+
         classes = ["none"]
         precs = [0]
         recs = [0]
         f1s = [0]
-    else:
-        precs = [det[c]["precision"] for c in classes]
-        recs = [det[c]["recall"] for c in classes]
-        f1s = [det[c]["f1"] for c in classes]
 
-    x = np.arange(len(classes))
+    else:
+
+        precs = [
+            det[c]["precision"]
+            for c in classes
+        ]
+
+        recs = [
+            det[c]["recall"]
+            for c in classes
+        ]
+
+        f1s = [
+            det[c]["f1"]
+            for c in classes
+        ]
+
+    x = np.arange(
+        len(classes)
+    )
+
     w = 0.25
 
     b1 = ax1.bar(
@@ -605,14 +890,20 @@ def plot_report(det, lat):
         color="#32CD32"
     )
 
-    ax1.set_xticks(x)
+    ax1.set_xticks(
+        x
+    )
+
     ax1.set_xticklabels(
         classes,
         color="white",
         rotation=20
     )
 
-    ax1.set_ylim(0, 1.1)
+    ax1.set_ylim(
+        0,
+        1.1
+    )
 
     ax1.set_title(
         "KITTI Detection Metrics",
@@ -673,8 +964,13 @@ def plot_report(det, lat):
         "mean": lat.get("mean_ms", 0)
     }
 
-    lat_keys = list(latency_display.keys())
-    lat_vals = list(latency_display.values())
+    lat_keys = list(
+        latency_display.keys()
+    )
+
+    lat_vals = list(
+        latency_display.values()
+    )
 
     bars = ax2.bar(
         lat_keys,
@@ -716,7 +1012,9 @@ def plot_report(det, lat):
         fontsize=9
     )
 
-    fps_text = f"FPS: {lat.get('fps', 0):.2f}"
+    fps_text = (
+        f"FPS: {lat.get('fps', 0):.2f}"
+    )
 
     ax2.text(
         0.5,
@@ -752,7 +1050,10 @@ def plot_report(det, lat):
 
     plt.show()
 
-    print("Saved plot:", save_path)
+    print(
+        "Saved plot:",
+        save_path
+    )
 
     return save_path
 
@@ -761,16 +1062,36 @@ def plot_report(det, lat):
 # SAVE JSON REPORT
 # =========================================================
 
-def save_json_report(det, lat, visual_paths):
+def save_json_report(
+    det,
+    lat,
+    visual_paths
+):
 
     final = {
+        "config": {
+            "BDD_PATH": BDD_PATH,
+            "KITTI_IMG": KITTI_IMG,
+            "KITTI_LBL": KITTI_LBL,
+            "N_IMAGES": N_IMAGES,
+            "N_LATENCY_IMAGES": N_LATENCY_IMAGES,
+            "N_VISUAL_SAMPLES": N_VISUAL_SAMPLES,
+            "PIPE_MODEL_WEIGHTS": PIPE_MODEL_WEIGHTS,
+            "PIPE_IMGSZ": PIPE_IMGSZ,
+            "PIPE_CONF": PIPE_CONF,
+            "DET_MODEL_WEIGHTS": DET_MODEL_WEIGHTS,
+            "DET_CONF": DET_CONF,
+            "IOU_THRESHOLD": IOU_THRESHOLD,
+            "DEVICE": str(DEVICE)
+        },
         "detection": det,
         "latency": lat,
         "visual_samples": visual_paths,
         "notes": {
             "detection_eval": "KITTI object dataset using IoU > 0.5 matching",
             "latency_eval": "End-to-end Phase4 pipeline latency on sample BDD/KITTI images",
-            "visualization": "Annotated images include tracking ID, class, confidence, distance, TTC and risk level"
+            "visualization": "Annotated images include tracking ID, class, confidence, distance, TTC and risk level",
+            "ttc_note": "TTC may show N/A for independent images because TTC requires temporal tracking over sequential frames."
         }
     }
 
@@ -779,10 +1100,21 @@ def save_json_report(det, lat, visual_paths):
         "phase5_report.json"
     )
 
-    with open(save_path, "w") as f:
-        json.dump(final, f, indent=2)
+    with open(
+        save_path,
+        "w"
+    ) as f:
 
-    print("Saved JSON:", save_path)
+        json.dump(
+            final,
+            f,
+            indent=2
+        )
+
+    print(
+        "Saved JSON:",
+        save_path
+    )
 
     return save_path
 
@@ -796,6 +1128,18 @@ def main():
     print("\n================================================")
     print("PHASE 5 FULL EVALUATION STARTED")
     print("================================================")
+
+    print(
+        "CUDA available:",
+        torch.cuda.is_available()
+    )
+
+    if torch.cuda.is_available():
+
+        print(
+            "CUDA device:",
+            torch.cuda.get_device_name(0)
+        )
 
     det = run_detection_eval()
 
@@ -831,4 +1175,5 @@ def main():
 # =========================================================
 
 if __name__ == "__main__":
+
     main()
