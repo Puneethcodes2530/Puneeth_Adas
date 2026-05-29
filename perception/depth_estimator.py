@@ -43,7 +43,7 @@ class DepthOutput:
     # SAMPLE DEPTH AT OBJECT BOUNDING BOX
     # ========================================================
 
-    def sample_at_bbox(self, bbox):
+    def sample_at_bbox(self, bbox, class_name='person'):
 
         x1, y1, x2, y2 = map(int, bbox)
 
@@ -127,12 +127,6 @@ class DepthOutput:
 
             'autorickshaw': 1.6
         }
-
-        class_name = getattr(
-            self,
-            "current_class",
-            "person"
-        )
 
         real_h = REAL_HEIGHTS.get(
             class_name,

@@ -78,7 +78,7 @@ class AdaptiveDetector:
 
     ADAS_CLASSES = {
         'person', 'bicycle', 'motorcycle',
-        'car', 'truck', 'bus','rickshaw'
+        'car', 'truck', 'bus','rickshaw',
         'traffic light', 'stop sign',
         'dog', 'cat', 'horse', 'cow'
     }
