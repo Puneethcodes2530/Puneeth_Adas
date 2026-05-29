@@ -61,7 +61,7 @@ from perception.depth_estimator import DepthEstimatorDA
 KITTI_ROOT = r"C:\Users\PTT933267\Downloads\Puneeth_Adas\Datasets\KITTI"
 
 # CHANGE THIS IMAGE ID ONLY
-IMAGE_ID = "007044"
+IMAGE_ID = "007479"
 
 IOU_THRESHOLD = 0.5
 

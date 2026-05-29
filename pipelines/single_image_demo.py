@@ -26,7 +26,7 @@ import matplotlib.pyplot as plt
 IMAGE_PATH = r"C:\Users\PTT933267\Downloads\Puneeth_Adas\Datasets\KITTI\data_object_image_2\training\image_2\007444.png"
 
 # Stable demo settings
-MODEL_WEIGHTS = "yolov8s.pt"
+MODEL_WEIGHTS = "yolov8x.pt"
 IMG_SIZE = 640
 CONF_THRESHOLD = 0.35
 SHOW_OUTPUT = True
