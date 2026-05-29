@@ -11,12 +11,14 @@ Features:
     - bbox height growth / tau-margin
 ✓ Weighted risk scoring
 ✓ FCW / AEB / VRU-ready output
+✓ Demo-optimized detection settings
 ✓ CPU/GPU-friendly configurable settings
 """
 
 import cv2
 import numpy as np
 import time
+import torch
 
 from ultralytics import YOLO
 from collections import deque
@@ -77,15 +79,23 @@ class TTCEngine:
 
     2. Tau-margin using bbox height growth:
        If object bbox height is increasing, object is approaching.
-
-    Final TTC is selected/fused based on availability and stability.
     """
 
-    def __init__(self, fps: float = 30.0):
-        self.fps = fps
-        self.dt = 1.0 / max(fps, 1e-6)
+    def __init__(
+        self,
+        fps: float = 30.0
+    ):
 
-    def _zone(self, ttc: float) -> str:
+        self.fps = fps
+        self.dt = 1.0 / max(
+            fps,
+            1e-6
+        )
+
+    def _zone(
+        self,
+        ttc: float
+    ) -> str:
 
         if ttc < 1.5:
             return "CRITICAL"
@@ -98,7 +108,10 @@ class TTCEngine:
 
         return "SAFE"
 
-    def compute(self, state: TrackState) -> TTCResult:
+    def compute(
+        self,
+        state: TrackState
+    ) -> TTCResult:
 
         if len(state.distances) < 3:
 
@@ -110,19 +123,35 @@ class TTCEngine:
         # ----------------------------------------------------
         # PATH A: DISTANCE-VELOCITY TTC
         # ----------------------------------------------------
-        d = list(state.distances)
+        d = list(
+            state.distances
+        )
 
         velocities = []
 
-        for i in range(1, len(d)):
+        for i in range(
+            1,
+            len(d)
+        ):
 
             # Positive velocity means object is approaching.
-            v = (d[i - 1] - d[i]) / self.dt
+            v = (
+                d[i - 1] -
+                d[i]
+            ) / self.dt
 
-            velocities.append(v)
+            velocities.append(
+                v
+            )
 
-        v_mean = float(np.mean(velocities))
-        v_std = float(np.std(velocities)) + 1.0
+        v_mean = float(
+            np.mean(velocities)
+        )
+
+        v_std = (
+            float(np.std(velocities)) +
+            1.0
+        )
 
         ttc_a = 999.0
 
@@ -144,10 +173,16 @@ class TTCEngine:
 
         if len(state.bbox_heights) >= 3:
 
-            heights = list(state.bbox_heights)
+            heights = list(
+                state.bbox_heights
+            )
+
             taus = []
 
-            for i in range(1, len(heights)):
+            for i in range(
+                1,
+                len(heights)
+            ):
 
                 dh = (
                     heights[i] -
@@ -159,7 +194,10 @@ class TTCEngine:
                     tau = heights[i] / dh
 
                     if 0.5 < tau < 60.0:
-                        taus.append(tau)
+
+                        taus.append(
+                            tau
+                        )
 
             if len(taus) > 0:
 
@@ -209,8 +247,13 @@ class TTCEngine:
             )
 
         return TTCResult(
-            value=round(float(ttc_final), 2),
-            zone=self._zone(float(ttc_final))
+            value=round(
+                float(ttc_final),
+                2
+            ),
+            zone=self._zone(
+                float(ttc_final)
+            )
         )
 
 
@@ -227,7 +270,18 @@ class Phase4TrackerPipeline:
         "bus": 3.2,
         "motorcycle": 1.2,
         "bicycle": 1.2,
-        "autorickshaw": 1.6
+        "autorickshaw": 1.6,
+
+        # Demo-relevant Indian road / animal classes
+        "dog": 0.6,
+        "cat": 0.3,
+        "horse": 1.6,
+        "sheep": 0.9,
+        "cow": 1.4,
+
+        # Infrastructure classes
+        "traffic light": 2.5,
+        "stop sign": 1.8
     }
 
     CLASS_WEIGHTS = {
@@ -237,15 +291,32 @@ class Phase4TrackerPipeline:
         "car": 0.7,
         "truck": 0.75,
         "bus": 0.75,
-        "autorickshaw": 0.8
+        "autorickshaw": 0.8,
+
+        # Demo-relevant Indian road / animal classes
+        "dog": 0.75,
+        "cat": 0.55,
+        "horse": 0.80,
+        "sheep": 0.70,
+        "cow": 0.85,
+
+        # Infrastructure classes
+        "traffic light": 0.35,
+        "stop sign": 0.45
     }
 
     VRU_CLASSES = {
         "person",
         "bicycle",
-        "motorcycle"
+        "motorcycle",
+        "dog",
+        "cat",
+        "horse",
+        "sheep",
+        "cow"
     }
 
+    # COCO class IDs used by YOLOv8
     YOLO_CLASSES = [
         0,    # person
         1,    # bicycle
@@ -254,7 +325,14 @@ class Phase4TrackerPipeline:
         5,    # bus
         7,    # truck
         9,    # traffic light
-        11    # stop sign
+        11,   # stop sign
+
+        # Useful for Indian road demos
+        16,   # dog
+        17,   # cat
+        18,   # horse
+        19,   # sheep
+        20    # cow
     ]
 
     def __init__(
@@ -266,7 +344,9 @@ class Phase4TrackerPipeline:
         conf: float = 0.35,
         iou: float = 0.45,
         imgsz: int = 640,
-        use_tracker: bool = True
+        use_tracker: bool = True,
+        device=None,
+        max_det: int = 100
     ):
 
         print("=" * 60)
@@ -281,6 +361,20 @@ class Phase4TrackerPipeline:
 
         print(f"✓ YOLO loaded: {model_weights}")
 
+        if device is None:
+
+            self.device = (
+                0
+                if torch.cuda.is_available()
+                else "cpu"
+            )
+
+        else:
+
+            self.device = device
+
+        print(f"✓ YOLO device: {self.device}")
+
         self.depth_fn = depth_fn
 
         self.fps = fps
@@ -290,6 +384,7 @@ class Phase4TrackerPipeline:
         self.iou = iou
         self.imgsz = imgsz
         self.use_tracker = use_tracker
+        self.max_det = max_det
 
         self.ttc_engine = TTCEngine(
             fps=fps
@@ -319,10 +414,18 @@ class Phase4TrackerPipeline:
             np.mean(gray)
         )
 
+        # ----------------------------------------------------
+        # If frame is normal/bright, do not alter it.
+        # YOLO usually performs better on natural images.
+        # ----------------------------------------------------
+        if brightness >= 95:
+
+            return frame.copy()
+
         enhanced = frame.copy()
 
         # ----------------------------------------------------
-        # NIGHT ENHANCEMENT
+        # Night / dark enhancement
         # ----------------------------------------------------
         if brightness < 75:
 
@@ -331,9 +434,13 @@ class Phase4TrackerPipeline:
                 cv2.COLOR_BGR2HSV
             )
 
-            h, s, v = cv2.split(hsv)
+            h, s, v = cv2.split(
+                hsv
+            )
 
-            v = cv2.equalizeHist(v)
+            v = cv2.equalizeHist(
+                v
+            )
 
             hsv = cv2.merge(
                 [h, s, v]
@@ -345,21 +452,25 @@ class Phase4TrackerPipeline:
             )
 
         # ----------------------------------------------------
-        # CLAHE CONTRAST ENHANCEMENT
+        # Mild CLAHE only when needed
         # ----------------------------------------------------
         lab = cv2.cvtColor(
             enhanced,
             cv2.COLOR_BGR2LAB
         )
 
-        l, a, b = cv2.split(lab)
+        l, a, b = cv2.split(
+            lab
+        )
 
         clahe = cv2.createCLAHE(
-            clipLimit=2.0,
+            clipLimit=1.5,
             tileGridSize=(8, 8)
         )
 
-        l = clahe.apply(l)
+        l = clahe.apply(
+            l
+        )
 
         lab = cv2.merge(
             (l, a, b)
@@ -398,11 +509,9 @@ class Phase4TrackerPipeline:
         y2 = max(0, min(y2, H - 1))
 
         if x2 <= x1 or y2 <= y1:
+
             return 999.0
 
-        # ----------------------------------------------------
-        # GEOMETRY DISTANCE
-        # ----------------------------------------------------
         bbox_h = max(
             y2 - y1,
             1
@@ -424,7 +533,8 @@ class Phase4TrackerPipeline:
         )
 
         geo_distance = (
-            self.focal_length * real_h
+            self.focal_length *
+            real_h
         ) / max(
             effective_size,
             1
@@ -438,10 +548,8 @@ class Phase4TrackerPipeline:
             )
         )
 
-        # ----------------------------------------------------
-        # IF NO DEPTH, RETURN GEOMETRY
-        # ----------------------------------------------------
         if depth_map is None:
+
             return geo_distance
 
         if depth_map.shape[:2] != (H, W):
@@ -451,10 +559,9 @@ class Phase4TrackerPipeline:
                 (W, H)
             )
 
-        # ----------------------------------------------------
-        # BOTTOM-CENTER ROI
-        # ----------------------------------------------------
-        cx = (x1 + x2) // 2
+        cx = (
+            x1 + x2
+        ) // 2
 
         half_w = max(
             4,
@@ -471,6 +578,7 @@ class Phase4TrackerPipeline:
         ]
 
         if roi.size == 0:
+
             return geo_distance
 
         valid = roi[
@@ -482,11 +590,9 @@ class Phase4TrackerPipeline:
         ]
 
         if valid.size == 0:
+
             return geo_distance
 
-        # ----------------------------------------------------
-        # DEPTH VALUE + CONFIDENCE
-        # ----------------------------------------------------
         depth_val = float(
             np.percentile(valid, 20)
         )
@@ -513,13 +619,7 @@ class Phase4TrackerPipeline:
             coeff_var
         )
 
-        # ----------------------------------------------------
-        # DEPTH DISTANCE HEURISTIC
-        # ----------------------------------------------------
-        #
         # Depth Anything is relative, not metric.
-        # This is only used as weak correction.
-        # ----------------------------------------------------
         depth_distance = (
             depth_val * 22.0
         ) + 3.0
@@ -532,9 +632,6 @@ class Phase4TrackerPipeline:
             )
         )
 
-        # ----------------------------------------------------
-        # GEOMETRY-FIRST DEPTH FUSION
-        # ----------------------------------------------------
         if depth_conf < 0.45:
 
             fused = geo_distance
@@ -585,9 +682,6 @@ class Phase4TrackerPipeline:
         frame_w: int
     ) -> Tuple[float, str]:
 
-        # ----------------------------------------------------
-        # TTC COMPONENT: 45%
-        # ----------------------------------------------------
         if ttc.value is None:
 
             ttc_s = 0.05
@@ -608,9 +702,6 @@ class Phase4TrackerPipeline:
 
             ttc_s = 0.1
 
-        # ----------------------------------------------------
-        # CLASS COMPONENT: 25%
-        # ----------------------------------------------------
         cls_s = self.CLASS_WEIGHTS.get(
             class_name,
             0.5
@@ -623,9 +714,6 @@ class Phase4TrackerPipeline:
                 0.85
             )
 
-        # ----------------------------------------------------
-        # EGO-LANE COMPONENT: 20%
-        # ----------------------------------------------------
         cx = (
             bbox[0] +
             bbox[2]
@@ -643,9 +731,6 @@ class Phase4TrackerPipeline:
             else 0.3
         )
 
-        # ----------------------------------------------------
-        # DISTANCE COMPONENT: 10%
-        # ----------------------------------------------------
         if distance_m < 10:
 
             dist_s = 1.0
@@ -658,9 +743,6 @@ class Phase4TrackerPipeline:
 
             dist_s = 0.2
 
-        # ----------------------------------------------------
-        # FINAL WEIGHTED SCORE
-        # ----------------------------------------------------
         score = (
             0.45 * ttc_s +
             0.25 * cls_s +
@@ -710,6 +792,69 @@ class Phase4TrackerPipeline:
                 self.tracks[tid].missed = 0
 
     # ========================================================
+    # YOLO INFERENCE
+    # ========================================================
+
+    def _run_yolo(
+        self,
+        infer_frame
+    ):
+
+        try:
+
+            if self.use_tracker:
+
+                results = self.model.track(
+                    infer_frame,
+                    persist=True,
+                    verbose=False,
+                    conf=self.conf,
+                    iou=self.iou,
+                    imgsz=self.imgsz,
+                    device=self.device,
+                    agnostic_nms=False,
+                    max_det=self.max_det,
+                    tracker="bytetrack.yaml",
+                    classes=self.YOLO_CLASSES
+                )
+
+            else:
+
+                results = self.model(
+                    infer_frame,
+                    verbose=False,
+                    conf=self.conf,
+                    iou=self.iou,
+                    imgsz=self.imgsz,
+                    device=self.device,
+                    agnostic_nms=False,
+                    max_det=self.max_det,
+                    classes=self.YOLO_CLASSES
+                )
+
+            return results
+
+        except Exception as e:
+
+            print(
+                f"[WARNING] Tracker failed, falling back to detection: {e}"
+            )
+
+            results = self.model(
+                infer_frame,
+                verbose=False,
+                conf=self.conf,
+                iou=self.iou,
+                imgsz=self.imgsz,
+                device=self.device,
+                agnostic_nms=False,
+                max_det=self.max_det,
+                classes=self.YOLO_CLASSES
+            )
+
+            return results
+
+    # ========================================================
     # MAIN PROCESS
     # ========================================================
 
@@ -722,14 +867,14 @@ class Phase4TrackerPipeline:
 
         start = time.perf_counter()
 
-        H, W = frame.shape[:2]
+        _, W = frame.shape[:2]
 
         infer_frame = self.enhance_frame(
             frame
         )
 
         # ----------------------------------------------------
-        # DEPTH
+        # Depth
         # ----------------------------------------------------
         depth_map = None
 
@@ -750,51 +895,11 @@ class Phase4TrackerPipeline:
                 depth_map = None
 
         # ----------------------------------------------------
-        # YOLO TRACKING / DETECTION
+        # YOLO tracking / detection
         # ----------------------------------------------------
-        try:
-
-            if self.use_tracker:
-
-                results = self.model.track(
-                    infer_frame,
-                    persist=True,
-                    verbose=False,
-                    conf=self.conf,
-                    iou=self.iou,
-                    imgsz=self.imgsz,
-                    agnostic_nms=True,
-                    tracker="bytetrack.yaml",
-                    classes=self.YOLO_CLASSES
-                )
-
-            else:
-
-                results = self.model(
-                    infer_frame,
-                    verbose=False,
-                    conf=self.conf,
-                    iou=self.iou,
-                    imgsz=self.imgsz,
-                    agnostic_nms=True,
-                    classes=self.YOLO_CLASSES
-                )
-
-        except Exception as e:
-
-            print(
-                f"[WARNING] Tracker failed, falling back to detection: {e}"
-            )
-
-            results = self.model(
-                infer_frame,
-                verbose=False,
-                conf=self.conf,
-                iou=self.iou,
-                imgsz=self.imgsz,
-                agnostic_nms=True,
-                classes=self.YOLO_CLASSES
-            )
+        results = self._run_yolo(
+            infer_frame
+        )
 
         result = results[0]
 
@@ -806,7 +911,9 @@ class Phase4TrackerPipeline:
 
             boxes = result.boxes
 
-            for i in range(len(boxes)):
+            for i in range(
+                len(boxes)
+            ):
 
                 x1, y1, x2, y2 = map(
                     int,
@@ -825,9 +932,6 @@ class Phase4TrackerPipeline:
                     cls_id
                 ]
 
-                # ------------------------------------------------
-                # TRACK ID
-                # ------------------------------------------------
                 if hasattr(boxes, "id") and boxes.id is not None:
 
                     tid = int(
@@ -838,11 +942,10 @@ class Phase4TrackerPipeline:
 
                     tid = i + self.frame_id * 10000
 
-                active_ids.add(tid)
+                active_ids.add(
+                    tid
+                )
 
-                # ------------------------------------------------
-                # TRACK STATE
-                # ------------------------------------------------
                 if tid not in self.tracks:
 
                     self.tracks[tid] = TrackState(
@@ -851,7 +954,9 @@ class Phase4TrackerPipeline:
                         bbox=[x1, y1, x2, y2]
                     )
 
-                state = self.tracks[tid]
+                state = self.tracks[
+                    tid
+                ]
 
                 state.age += 1
                 state.class_name = cls_name
@@ -866,9 +971,6 @@ class Phase4TrackerPipeline:
                     bbox_h
                 )
 
-                # ------------------------------------------------
-                # DISTANCE
-                # ------------------------------------------------
                 distance = self.estimate_distance(
                     frame,
                     depth_map,
@@ -876,7 +978,6 @@ class Phase4TrackerPipeline:
                     cls_name
                 )
 
-                # Light distance smoothing per track.
                 if len(state.distances) > 0:
 
                     previous = state.distances[-1]
@@ -890,16 +991,10 @@ class Phase4TrackerPipeline:
                     distance
                 )
 
-                # ------------------------------------------------
-                # TTC
-                # ------------------------------------------------
                 ttc = self.ttc_engine.compute(
                     state
                 )
 
-                # ------------------------------------------------
-                # WEIGHTED RISK
-                # ------------------------------------------------
                 risk_score, risk = self.compute_risk(
                     class_name=cls_name,
                     ttc=ttc,
@@ -925,6 +1020,20 @@ class Phase4TrackerPipeline:
             active_ids
         )
 
+        objects = sorted(
+            objects,
+            key=lambda obj: (
+                {
+                    "LOW": 1,
+                    "MEDIUM": 2,
+                    "HIGH": 3,
+                    "CRITICAL": 4
+                }.get(obj.risk, 0),
+                obj.risk_score
+            ),
+            reverse=True
+        )
+
         latency = (
             time.perf_counter() -
             start
@@ -945,25 +1054,44 @@ class Phase4TrackerPipeline:
 
         vis = frame.copy()
 
-        colors = {
+        risk_colors = {
             "LOW": (0, 255, 0),
             "MEDIUM": (0, 200, 255),
             "HIGH": (0, 120, 255),
             "CRITICAL": (0, 0, 255)
         }
 
+        class_colors = {
+            "person": (255, 80, 80),
+            "bicycle": (255, 165, 0),
+            "motorcycle": (255, 140, 0),
+            "car": (50, 205, 50),
+            "truck": (0, 128, 255),
+            "bus": (128, 0, 255),
+            "traffic light": (255, 255, 0),
+            "stop sign": (255, 0, 128),
+            "dog": (180, 120, 255),
+            "cat": (180, 120, 255),
+            "horse": (180, 120, 255),
+            "sheep": (180, 120, 255),
+            "cow": (180, 120, 255)
+        }
+
         for obj in objects:
 
             x1, y1, x2, y2 = obj.bbox
 
-            color = colors.get(
+            color = risk_colors.get(
                 obj.risk,
-                (255, 255, 255)
+                class_colors.get(
+                    obj.class_name,
+                    (255, 255, 255)
+                )
             )
 
             thickness = (
                 3
-                if obj.risk == "CRITICAL"
+                if obj.risk in ["HIGH", "CRITICAL"]
                 else 2
             )
 
@@ -981,36 +1109,91 @@ class Phase4TrackerPipeline:
                 else "N/A"
             )
 
-            lines = [
+            label_lines = [
                 f"ID:{obj.track_id}",
                 f"{obj.class_name} {obj.confidence:.2f}",
                 f"{obj.distance_m:.1f}m",
                 f"TTC:{ttc_text}",
-                f"Risk:{obj.risk}",
-                f"Score:{obj.risk_score:.2f}"
+                f"{obj.risk} {obj.risk_score:.2f}"
             ]
 
-            for idx, line in enumerate(lines):
+            # ------------------------------------------------
+            # Label background
+            # ------------------------------------------------
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.45
+            font_thick = 1
+            line_h = 15
 
-                yy = y1 - 85 + idx * 15
+            label_w = 0
 
-                if yy < 8:
+            for line in label_lines:
 
-                    yy = y2 + 15 + idx * 15
+                (tw, _), _ = cv2.getTextSize(
+                    line,
+                    font,
+                    font_scale,
+                    font_thick
+                )
+
+                label_w = max(
+                    label_w,
+                    tw
+                )
+
+            label_h = line_h * len(label_lines) + 6
+
+            label_x1 = x1
+            label_y1 = y1 - label_h - 4
+
+            if label_y1 < 0:
+                label_y1 = y2 + 4
+
+            label_x2 = min(
+                vis.shape[1] - 1,
+                label_x1 + label_w + 8
+            )
+
+            label_y2 = min(
+                vis.shape[0] - 1,
+                label_y1 + label_h
+            )
+
+            cv2.rectangle(
+                vis,
+                (label_x1, label_y1),
+                (label_x2, label_y2),
+                (0, 0, 0),
+                -1
+            )
+
+            cv2.rectangle(
+                vis,
+                (label_x1, label_y1),
+                (label_x2, label_y2),
+                color,
+                1
+            )
+
+            for idx, line in enumerate(
+                label_lines
+            ):
+
+                yy = label_y1 + 14 + idx * line_h
 
                 cv2.putText(
                     vis,
                     line,
-                    (x1, yy),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
+                    (label_x1 + 4, yy),
+                    font,
+                    font_scale,
                     color,
-                    1,
+                    font_thick,
                     cv2.LINE_AA
                 )
 
         # ----------------------------------------------------
-        # HUD
+        # Top HUD
         # ----------------------------------------------------
         cv2.rectangle(
             vis,
@@ -1025,7 +1208,8 @@ class Phase4TrackerPipeline:
             (
                 f"NeuroSentinel v3 | {self.model_weights} | "
                 f"Tracking + Distance + TTC + Risk | "
-                f"{latency:.0f} ms"
+                f"{latency:.0f} ms | "
+                f"Objects:{len(objects)}"
             ),
             (10, 36),
             cv2.FONT_HERSHEY_SIMPLEX,
