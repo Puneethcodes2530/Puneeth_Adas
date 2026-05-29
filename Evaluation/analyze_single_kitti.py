@@ -1,59 +1,84 @@
 """
-NeuroSentinel v3
-Single KITTI Image Analysis
+NeuroSentinel v3 — Single KITTI Image Analysis
 
 Compares:
 1. Ground Truth Distance
 2. Geometry-only Distance
-3. Depth Fusion Distance
+3. Geometry + Depth Fusion Distance
 
-for ONE image.
+For ONE KITTI training image.
 
 Outputs:
 - visual comparison
 - per-object errors
 - depth map
+- saved analysis image
+
+How to use:
+Change IMAGE_ID below and run:
+python Evaluation/analyze_single_kitti.py
 """
 
-import cv2
-import numpy as np
 import os
 import sys
+import cv2
+import numpy as np
 import matplotlib.pyplot as plt
+
 from dataclasses import dataclass
 
 
 # ============================================================
-# IMPORT PROJECT
+# PROJECT ROOT
 # ============================================================
+
+ROOT = os.path.abspath(
+    os.path.dirname(
+        os.path.dirname(__file__)
+    )
+)
 
 sys.path.insert(
     0,
-    os.path.abspath(
-        os.path.dirname(
-            os.path.dirname(__file__)
-        )
-    )
+    ROOT
 )
+
+print("Project root:", ROOT)
+
+
+# ============================================================
+# IMPORT PROJECT MODULES
+# ============================================================
 
 from perception.detector import AdaptiveDetector
 from perception.depth_estimator import DepthEstimatorDA
 
 
 # ============================================================
-# CONFIG
+# CONFIG — CHANGE ONLY THESE IF NEEDED
 # ============================================================
 
 KITTI_ROOT = r"C:\Users\PTT933267\Downloads\Puneeth_Adas\Datasets\KITTI"
 
-# CHANGE THIS IMAGE ID
-IMAGE_ID = "007069"
+# CHANGE THIS IMAGE ID ONLY
+IMAGE_ID = "007044"
 
 IOU_THRESHOLD = 0.5
 
+OUTPUT_DIR = os.path.join(
+    ROOT,
+    "outputs",
+    "single_analysis"
+)
+
+os.makedirs(
+    OUTPUT_DIR,
+    exist_ok=True
+)
+
 
 # ============================================================
-# KITTI LABEL
+# KITTI LABEL STRUCTURE
 # ============================================================
 
 @dataclass
@@ -69,20 +94,13 @@ class KITTILabel:
     def adas_class(self):
 
         mapping = {
-
-            'Car': 'car',
-
-            'Van': 'car',
-
-            'Truck': 'truck',
-
-            'Pedestrian': 'person',
-
-            'Person_sitting': 'person',
-
-            'Cyclist': 'bicycle',
-
-            'Tram': 'bus'
+            "Car": "car",
+            "Van": "car",
+            "Truck": "truck",
+            "Pedestrian": "person",
+            "Person_sitting": "person",
+            "Cyclist": "bicycle",
+            "Tram": "bus"
         }
 
         return mapping.get(
@@ -94,13 +112,9 @@ class KITTILabel:
     def is_valid(self):
 
         return (
-
             self.truncated < 0.5 and
-
             self.occluded < 2 and
-
             self.z_3d > 0 and
-
             self.z_3d < 80
         )
 
@@ -113,7 +127,12 @@ def parse_kitti_label_file(label_path):
 
     labels = []
 
-    with open(label_path, 'r') as f:
+    if not os.path.exists(label_path):
+
+        print("[ERROR] Label file not found:", label_path)
+        return labels
+
+    with open(label_path, "r") as f:
 
         for line in f.readlines():
 
@@ -128,23 +147,16 @@ def parse_kitti_label_file(label_path):
                 continue
 
             labels.append(
-
                 KITTILabel(
-
                     obj_type=obj_type,
-
                     truncated=float(parts[1]),
-
                     occluded=int(parts[2]),
-
                     bbox_2d=[
-
                         float(parts[4]),
                         float(parts[5]),
                         float(parts[6]),
                         float(parts[7])
                     ],
-
                     z_3d=float(parts[13])
                 )
             )
@@ -192,198 +204,99 @@ def geometry_distance(det):
 
     x1, y1, x2, y2 = det.bbox
 
-    bbox_h = y2 - y1
-    bbox_w = x2 - x1
+    bbox_h = max(y2 - y1, 1)
+    bbox_w = max(x2 - x1, 1)
 
     effective_size = (
-
-        0.7 * bbox_h +
-
-        0.3 * bbox_w
+        0.75 * bbox_h +
+        0.25 * bbox_w
     )
 
-    REAL_HEIGHTS = {
-
-        'person': 1.7,
-
-        'car': 1.5,
-
-        'truck': 3.2,
-
-        'bus': 3.0,
-
-        'motorcycle': 1.2,
-
-        'bicycle': 1.1
+    real_heights = {
+        "person": 1.7,
+        "car": 1.5,
+        "truck": 3.2,
+        "bus": 3.0,
+        "motorcycle": 1.2,
+        "bicycle": 1.1
     }
 
-    real_h = REAL_HEIGHTS.get(
+    real_h = real_heights.get(
         det.class_name,
-        1.7
+        1.5
     )
 
-    FOCAL_LENGTH = 850
+    focal_length = 850.0
 
     dist = (
-        FOCAL_LENGTH * real_h
+        focal_length *
+        real_h
     ) / max(effective_size, 1)
 
-    return dist
+    return float(
+        np.clip(
+            dist,
+            1.0,
+            120.0
+        )
+    )
 
 
 # ============================================================
-# DEPTH FUSION
+# DEPTH FUSION DISTANCE
 # ============================================================
 
 def fusion_distance(det, depth_out):
 
-    # ========================================================
-    # BASE GEOMETRY DISTANCE
-    # ========================================================
+    """
+    Uses the robust depth sampling function from DepthOutput.
 
-    geom_dist = geometry_distance(det)
+    This is safer than manually duplicating depth fusion logic here.
+    """
 
-    # ========================================================
-    # BBOX
-    # ========================================================
+    try:
 
-    x1, y1, x2, y2 = map(int, det.bbox)
+        sample = depth_out.sample_at_bbox(
+            det.bbox,
+            class_name=det.class_name
+        )
 
-    h, w = depth_out.depth_map.shape
+        return float(
+            sample["distance_m"]
+        )
 
-    # ========================================================
-    # SAFETY CLAMP
-    # ========================================================
+    except Exception as e:
 
-    x1 = max(0, min(x1, w - 1))
-    x2 = max(0, min(x2, w - 1))
+        print(
+            f"[WARNING] Fusion failed for {det.class_name}: {e}"
+        )
 
-    y1 = max(0, min(y1, h - 1))
-    y2 = max(0, min(y2, h - 1))
+        return geometry_distance(det)
 
-    # Invalid box
-    if x2 <= x1 or y2 <= y1:
-        return geom_dist
 
-    # ========================================================
-    # FOOT ROI
-    # ========================================================
-    #
-    # Bottom region is more stable
-    # for road-contact objects.
-    # ========================================================
+# ============================================================
+# DEPTH VISUALIZATION
+# ============================================================
 
-    foot_y = y2
+def make_depth_vis(depth_map):
 
-    y_start = max(
-        foot_y - 12,
-        0
+    d = depth_map.copy()
+
+    d = (
+        (d - d.min()) /
+        (d.max() - d.min() + 1e-6)
     )
 
-    roi = depth_out.depth_map[
-        y_start:foot_y,
-        x1:x2
-    ]
+    d = (
+        d * 255
+    ).astype(np.uint8)
 
-    # Empty ROI
-    if roi.size == 0:
-        return geom_dist
-
-    # ========================================================
-    # DEPTH STATISTICS
-    # ========================================================
-
-    depth_mean = float(
-        np.mean(roi)
+    depth_vis = cv2.applyColorMap(
+        d,
+        cv2.COLORMAP_MAGMA
     )
 
-    depth_std = float(
-        np.std(roi)
-    )
-
-    # ========================================================
-    # DEPTH STABILITY
-    # ========================================================
-    #
-    # Lower std = more stable
-    # ========================================================
-
-    stability = 1.0 - min(
-        1.0,
-        depth_std / (depth_mean + 1e-6)
-    )
-
-    # ========================================================
-    # ROBUST DEPTH VALUE
-    # ========================================================
-
-    raw_depth = float(
-        np.percentile(roi, 20)
-    )
-
-    raw_depth = max(raw_depth, 0.05)
-
-    # ========================================================
-    # SMALL RELATIVE CORRECTION
-    # ========================================================
-    #
-    # DO NOT aggressively invert depth.
-    #
-    # Depth Anything gives:
-    # relative depth
-    #
-    # not exact metric metres.
-    #
-    # So:
-    # use depth as slight refinement only.
-    # ========================================================
-
-    correction = 1.0 + (
-        (0.5 - raw_depth) * 0.25
-    )
-
-    correction = np.clip(
-        correction,
-        0.85,
-        1.15
-    )
-
-    # ========================================================
-    # DEPTH-REFINED DISTANCE
-    # ========================================================
-
-    depth_adjusted = (
-        geom_dist * correction
-    )
-
-    # ========================================================
-    # CONFIDENCE-WEIGHTED FUSION
-    # ========================================================
-    #
-    # If depth unstable:
-    # trust geometry more
-    # ========================================================
-
-    fusion_weight = 0.15 * stability
-
-    final_dist = (
-
-        (1 - fusion_weight) * geom_dist +
-
-        fusion_weight * depth_adjusted
-    )
-
-    # ========================================================
-    # FINAL SAFETY CLAMP
-    # ========================================================
-
-    final_dist = np.clip(
-        final_dist,
-        1.0,
-        120.0
-    )
-
-    return float(final_dist)
+    return depth_vis
 
 
 # ============================================================
@@ -392,80 +305,120 @@ def fusion_distance(det, depth_out):
 
 def run():
 
-    print("=" * 60)
+    print("=" * 70)
     print("Single KITTI Image Analysis")
-    print("=" * 60)
+    print("=" * 70)
 
     image_path = os.path.join(
-
         KITTI_ROOT,
-
         "data_object_image_2",
-
         "training",
-
         "image_2",
-
         IMAGE_ID + ".png"
     )
 
-    
-    print("Loading from:", image_path)  # ✅ ADD THIS LINE
-
-
     label_path = os.path.join(
-
         KITTI_ROOT,
-
         "data_object_label_2",
-
         "training",
-
         "label_2",
-
         IMAGE_ID + ".txt"
     )
+
+    print("Loading image from:", image_path)
+    print("Loading label from:", label_path)
+
+    if not os.path.exists(image_path):
+
+        print("[ERROR] Image path does not exist.")
+        return
+
+    if not os.path.exists(label_path):
+
+        print("[ERROR] Label path does not exist.")
+        return
+
+    # --------------------------------------------------------
+    # Load models
+    # --------------------------------------------------------
 
     print("\nLoading models...")
 
     detector = AdaptiveDetector(
-        'yolov8s.pt'
+        model_weights="yolov8s.pt",
+        budget_ms=1000.0,
+        scene_update_every=15
     )
 
     depth_estimator = DepthEstimatorDA()
 
     print("✓ Models loaded")
 
-    frame = cv2.imread(image_path)
+    frame = cv2.imread(
+        image_path
+    )
 
     if frame is None:
 
-        print("Image not found")
+        print("[ERROR] Image could not be read.")
         return
 
+    # --------------------------------------------------------
+    # Parse GT labels
+    # --------------------------------------------------------
+
     gt_labels = [
-
-        l for l in
-        parse_kitti_label_file(label_path)
-
-        if l.is_valid and l.adas_class
+        label
+        for label in parse_kitti_label_file(label_path)
+        if label.is_valid and label.adas_class
     ]
 
-    det_output = detector.process(frame)
+    print(f"Valid GT objects: {len(gt_labels)}")
 
-    depth_out = depth_estimator.estimate(frame)
+    # --------------------------------------------------------
+    # Run detection + depth
+    # --------------------------------------------------------
+
+    det_output = detector.process(
+        frame
+    )
+
+    depth_out = depth_estimator.estimate(
+        frame
+    )
+
+    print(f"Detected ADAS objects: {len(det_output.detections)}")
+    print(f"Depth inference: {depth_out.processing_ms:.1f} ms")
 
     vis = frame.copy()
 
-    print("\nPer-object comparison:")
-    print("-" * 60)
-
     matched_pred = set()
+
+    rows = []
+
+    print("\nPer-object comparison:")
+    print("-" * 90)
+
+    print(
+        f"{'Class':<10} "
+        f"{'GT(m)':>8} "
+        f"{'Geom(m)':>10} "
+        f"{'Fusion(m)':>11} "
+        f"{'G-Err':>8} "
+        f"{'F-Err':>8} "
+        f"{'IoU':>6}"
+    )
+
+    print("-" * 90)
+
+    # --------------------------------------------------------
+    # Match GT objects to detections
+    # --------------------------------------------------------
 
     for gt in gt_labels:
 
         best_iou = IOU_THRESHOLD
-        best_det = None
+        best_det_idx = None
 
         for det_idx, det in enumerate(
             det_output.detections
@@ -485,22 +438,26 @@ def run():
             if iou > best_iou:
 
                 best_iou = iou
-                best_det = det_idx
+                best_det_idx = det_idx
 
-        if best_det is None:
+        if best_det_idx is None:
             continue
 
-        matched_pred.add(best_det)
+        matched_pred.add(
+            best_det_idx
+        )
 
         det = det_output.detections[
-            best_det
+            best_det_idx
         ]
 
         gt_dist = gt.z_3d
 
-        geom_dist = geometry_distance(det)
+        geom_dist = geometry_distance(
+            det
+        )
 
-        fusion_dist = fusion_distance(
+        fused_dist = fusion_distance(
             det,
             depth_out
         )
@@ -510,11 +467,23 @@ def run():
         )
 
         fusion_err = abs(
-            fusion_dist - gt_dist
+            fused_dist - gt_dist
+        )
+
+        rows.append(
+            {
+                "class": det.class_name,
+                "gt": gt_dist,
+                "geometry": geom_dist,
+                "fusion": fused_dist,
+                "geom_err": geom_err,
+                "fusion_err": fusion_err,
+                "iou": best_iou
+            }
         )
 
         # ----------------------------------------------------
-        # DRAW
+        # Draw detection box
         # ----------------------------------------------------
 
         x1, y1, x2, y2 = map(
@@ -522,10 +491,11 @@ def run():
             det.bbox
         )
 
-        if fusion_err < geom_err:
-            color = (0, 255, 0)
-        else:
-            color = (0, 0, 255)
+        color = (
+            (0, 255, 0)
+            if fusion_err < geom_err
+            else (0, 0, 255)
+        )
 
         cv2.rectangle(
             vis,
@@ -536,64 +506,77 @@ def run():
         )
 
         label = (
-
             f"{det.class_name} "
-
             f"GT:{gt_dist:.1f} "
-
             f"G:{geom_dist:.1f} "
-
-            f"F:{fusion_dist:.1f}"
+            f"F:{fused_dist:.1f}"
         )
 
         cv2.putText(
-
             vis,
-
             label,
-
             (x1, max(20, y1 - 10)),
-
             cv2.FONT_HERSHEY_SIMPLEX,
-
             0.45,
-
             color,
-
-            2
+            2,
+            cv2.LINE_AA
         )
 
         print(
-
-            f"{det.class_name:<10}"
-
-            f"GT:{gt_dist:>6.1f}m "
-
-            f"G:{geom_dist:>6.1f}m "
-
-            f"F:{fusion_dist:>6.1f}m "
-
-            f"G-Err:{geom_err:>5.1f} "
-
-            f"F-Err:{fusion_err:>5.1f}"
+            f"{det.class_name:<10} "
+            f"{gt_dist:>8.1f} "
+            f"{geom_dist:>10.1f} "
+            f"{fused_dist:>11.1f} "
+            f"{geom_err:>8.1f} "
+            f"{fusion_err:>8.1f} "
+            f"{best_iou:>6.2f}"
         )
 
-    # ========================================================
-    # DEPTH MAP
-    # ========================================================
+    # --------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------
 
-    depth_vis = (
-        depth_out.depth_map * 255
-    ).astype(np.uint8)
+    print("-" * 90)
 
-    depth_vis = cv2.applyColorMap(
-        depth_vis,
-        cv2.COLORMAP_MAGMA
+    if len(rows) == 0:
+
+        print(
+            "[WARNING] No GT-detection matches found. "
+            "Try lowering IOU_THRESHOLD to 0.3 or use another IMAGE_ID."
+        )
+
+    else:
+
+        geom_mae = np.mean(
+            [r["geom_err"] for r in rows]
+        )
+
+        fusion_mae = np.mean(
+            [r["fusion_err"] for r in rows]
+        )
+
+        improvement = (
+            (geom_mae - fusion_mae) /
+            (geom_mae + 1e-6)
+        ) * 100
+
+        print(f"Matched objects: {len(rows)}")
+        print(f"Geometry MAE: {geom_mae:.2f} m")
+        print(f"Fusion MAE:   {fusion_mae:.2f} m")
+        print(f"Improvement:  {improvement:.2f}%")
+
+    # --------------------------------------------------------
+    # Depth map
+    # --------------------------------------------------------
+
+    depth_vis = make_depth_vis(
+        depth_out.depth_map
     )
 
-    # ========================================================
-    # PLOT
-    # ========================================================
+    # --------------------------------------------------------
+    # Plot
+    # --------------------------------------------------------
 
     fig, axes = plt.subplots(
         1,
@@ -609,10 +592,12 @@ def run():
     )
 
     axes[0].set_title(
-        "Detection + Comparison"
+        "Detection + GT vs Geometry vs Fusion"
     )
 
-    axes[0].axis('off')
+    axes[0].axis(
+        "off"
+    )
 
     axes[1].imshow(
         cv2.cvtColor(
@@ -622,33 +607,29 @@ def run():
     )
 
     axes[1].set_title(
-        "Depth Map"
+        "Depth Anything Map"
     )
 
-    axes[1].axis('off')
+    axes[1].axis(
+        "off"
+    )
 
     plt.tight_layout()
 
-    os.makedirs(
-        "outputs/single_analysis",
-        exist_ok=True
-    )
-
     save_path = os.path.join(
-
-        "outputs/single_analysis",
-
+        OUTPUT_DIR,
         f"{IMAGE_ID}_analysis.png"
     )
 
     plt.savefig(
         save_path,
-        dpi=150
+        dpi=150,
+        bbox_inches="tight"
     )
 
     plt.show()
 
-    print(f"\nSaved: {save_path}")
+    print("\nSaved:", save_path)
 
 
 # ============================================================

@@ -1,170 +1,442 @@
 """
 Adaptive Detection Pipeline
-Combines SceneDetector + YOLOv8 with dynamic thresholds.
-This is Phase 2 complete pipeline.
-"""
-import cv2 # Computer vision library used for image handling, drawing boxes and test and processing(resizing, color conversion , blur and filters)
-import numpy as np #Matrix, Math operations
-import time #Time measurement module
-import json #Data storage in JSON format
-import os #OS interface, used for file handling and directory creation
-import sys #System level operations to allow imports from other files and stuff
-from dataclasses import dataclass, field #A cleaner way to create data structures
-from typing import List, Optional # For readability, and better use case
 
-sys.path.insert(0, os.path.dirname(
-    os.path.dirname(os.path.abspath(__file__))))
-#__file__ shows the current file path and the abspath converts it into absolute path, next the os.path.dirname, moves it a level up and one more on the outside moves it even one more level up so pushing us to the root folder
-#The last sys.path.insert(0, ...) ensures to include this in the python import search path, for importing further files like below in future
+Combines CLIP-based Scene Analyzer + YOLOv8 with dynamic thresholds.
+
+This is the Phase 2 adaptive detection module.
+
+Features:
+✓ CLIP scene/weather detection
+✓ Scene-aware YOLO confidence thresholding
+✓ Confidence penalty under degraded scenes
+✓ ADAS class filtering
+✓ VRU identification
+✓ Geometry-based distance estimate
+✓ CUDA-aware YOLO execution
+✓ Robust fallback if scene detector fails
+"""
+
+import cv2
+import numpy as np
+import time
+import os
+import sys
+import torch
+
+from dataclasses import dataclass
+from typing import List, Optional
+
+
+# ============================================================
+# PROJECT ROOT IMPORT FIX
+# ============================================================
+
+sys.path.insert(
+    0,
+    os.path.dirname(
+        os.path.dirname(
+            os.path.abspath(__file__)
+        )
+    )
+)
+
+
 from perception.scene_analyzer import (
-    SceneState, #CLIP imported ✅
+    SceneState,
     CLIPSceneDetector
 )
 
 
+# ============================================================
+# DATA STRUCTURES
+# ============================================================
+
 @dataclass
 class Detection:
-    class_name: str #The detected object is stored as a string as either car, truck, person, motorcycle
-    raw_confidence: float #Original yolo confidence score that the model gives
-    adj_confidence: float # This is after the scene penalty (if raw confidence is 0.8 and penalty is 0.7, it becomes 0.8*0.7=0.56)
-    bbox: List[int] # [x1,y1,x2,y2] for the coordinates of the bounding box, top left is (x1,y1), bottom right is (x2,y2)
-    width_px: int #width of the object calculated as x2-x1
-    height_px: int #height of the object is calculated as y2-y1
-    est_distance_m: float # heuristic — replaced later with hybrid(depth+geometry)
-    is_vru: bool # pedestrian/cyclist/motorcycle, Adas gives higher priority to VRU's
+    class_name: str
+    raw_confidence: float
+    adj_confidence: float
+    bbox: List[int]
+    width_px: int
+    height_px: int
+    est_distance_m: float
+    is_vru: bool
 
 
 @dataclass
 class FrameOutput:
-    frame_id: int #Each frame gets it's own number
-    timestamp_ms: float #Time when frame was processed
-    scene: SceneState #Output from the Scenestate that we imported, useful like for finding if it is night and all
-    detections: List[Detection] #List of all the objects in the frame
-    n_objects: int #len(detections), basically for the number of the objects detected in the frame
-    processing_ms: float #Time taken to process whole pipeline, Object detection+depth+scene detection
-    within_budget: bool #for now capped at 40ms, but lets see regarding optimization on the later parts...
+    frame_id: int
+    timestamp_ms: float
+    scene: SceneState
+    detections: List[Detection]
+    n_objects: int
+    processing_ms: float
+    within_budget: bool
 
-    def to_dict(self) -> dict: #Converts the frame output object to a dictionary, for easy future json output and all
+    def to_dict(self) -> dict:
+
         return {
-            'frame_id': self.frame_id,
-            'timestamp_ms': self.timestamp_ms,
-            'scene_condition': self.scene.condition,
-            'scene_severity': self.scene.severity,
-            'conf_threshold': self.scene.conf_threshold,
-            'n_objects': self.n_objects,
-            'processing_ms': round(self.processing_ms, 1),
-            'within_budget': self.within_budget,
-            'detections': [
+            "frame_id": self.frame_id,
+            "timestamp_ms": self.timestamp_ms,
+
+            "scene_condition": self.scene.condition,
+            "scene_severity": round(self.scene.severity, 3),
+            "scene_confidence": round(self.scene.confidence, 3),
+            "conf_threshold": self.scene.conf_threshold,
+            "confidence_penalty": self.scene.confidence_penalty,
+
+            "n_objects": self.n_objects,
+            "processing_ms": round(self.processing_ms, 1),
+            "within_budget": self.within_budget,
+
+            "detections": [
                 {
-                    'class': d.class_name,
-                    'raw_conf': round(d.raw_confidence, 3),
-                    'adj_conf': round(d.adj_confidence, 3),
-                    'bbox': d.bbox,
-                    'height_px': d.height_px,
-                    'est_distance_m': d.est_distance_m,
-                    'is_vru': d.is_vru,
+                    "class": d.class_name,
+                    "raw_conf": round(d.raw_confidence, 3),
+                    "adj_conf": round(d.adj_confidence, 3),
+                    "bbox": d.bbox,
+                    "width_px": d.width_px,
+                    "height_px": d.height_px,
+                    "est_distance_m": d.est_distance_m,
+                    "is_vru": d.is_vru,
                 }
                 for d in self.detections
             ]
         }
 
 
+# ============================================================
+# ADAPTIVE DETECTOR
+# ============================================================
+
 class AdaptiveDetector:
 
     VRU_CLASSES = {
-        'person', 'bicycle', 'motorcycle',
-        'dog', 'cat', 'horse', 'cow'
+        "person",
+        "bicycle",
+        "motorcycle",
+        "dog",
+        "cat",
+        "horse",
+        "cow"
     }
 
     ADAS_CLASSES = {
-        'person', 'bicycle', 'motorcycle',
-        'car', 'truck', 'bus','rickshaw',
-        'traffic light', 'stop sign',
-        'dog', 'cat', 'horse', 'cow'
+        "person",
+        "bicycle",
+        "motorcycle",
+        "car",
+        "truck",
+        "bus",
+        "traffic light",
+        "stop sign",
+        "dog",
+        "cat",
+        "horse",
+        "cow",
+        "rickshaw",
+        "autorickshaw"
     }
 
     REAL_HEIGHTS = {
-        'person': 1.75,
-        'car': 1.50,
-        'truck': 3.50,
-        'bus': 3.20,
-        'bicycle': 1.10,
-        'motorcycle': 1.20,
+        "person": 1.75,
+        "car": 1.50,
+        "truck": 3.50,
+        "bus": 3.20,
+        "bicycle": 1.10,
+        "motorcycle": 1.20,
+        "dog": 0.60,
+        "cat": 0.30,
+        "horse": 1.60,
+        "cow": 1.45,
+        "rickshaw": 1.60,
+        "autorickshaw": 1.60
     }
 
-    FOCAL_LENGTH = 720 # approximate for dashcam
+    COLORS = {
+        "person": (255, 50, 50),
+        "bicycle": (255, 165, 0),
+        "motorcycle": (255, 140, 0),
+        "car": (50, 205, 50),
+        "truck": (0, 128, 255),
+        "bus": (128, 0, 255),
+        "traffic light": (255, 255, 0),
+        "stop sign": (255, 0, 128),
+        "dog": (180, 120, 255),
+        "cat": (180, 120, 255),
+        "horse": (180, 120, 255),
+        "cow": (180, 120, 255),
+        "rickshaw": (0, 255, 180),
+        "autorickshaw": (0, 255, 180)
+    }
 
-    def __init__(self, model_weights: str = 'yolov8s.pt',
-                 budget_ms: float = 40.0):
+    COND_COLORS = {
+        "CLEAR": (0, 255, 0),
+        "NIGHT": (100, 100, 255),
+        "FOG": (200, 200, 200),
+        "RAIN": (0, 200, 255),
+        "GLARE": (255, 255, 0),
+        "DUST": (200, 150, 50),
+    }
+
+    def __init__(
+        self,
+        model_weights: str = "yolov8s.pt",
+        budget_ms: float = 40.0,
+        focal_length: float = 720.0,
+        use_clip: bool = True,
+        scene_update_every: int = 15,
+        device: Optional[str] = None
+    ):
 
         from ultralytics import YOLO
 
-        print(f"Loading {model_weights}...")
+        print("=" * 60)
+        print("Loading AdaptiveDetector")
+        print("=" * 60)
+
+        self.model_weights = model_weights
         self.model = YOLO(model_weights)
 
+        # ----------------------------------------------------
+        # Device selection
+        # ----------------------------------------------------
+        if device is None:
+            self.device = (
+                "cuda:0"
+                if torch.cuda.is_available()
+                else "cpu"
+            )
+        else:
+            self.device = device
+
+        print(f"✓ YOLO loaded: {model_weights}")
+        print(f"✓ YOLO device: {self.device}")
+
         self.budget = budget_ms
+        self.focal_length = focal_length
         self.frame_id = 0
 
-        # ✅ CLIP initialized correctly
-        self.clip = CLIPSceneDetector()
+        self.use_clip = use_clip
 
-        print("The AdaptiveDetector Module is ready")
+        if self.use_clip:
 
-    def process(self, frame: np.ndarray) -> FrameOutput:
+            self.clip = CLIPSceneDetector(
+                update_every=scene_update_every
+            )
 
-        t_total = time.perf_counter()
-        self.frame_id += 1
+        else:
 
-        # ✅ STEP 1: CLIP Scene detection
-        clip_condition, clip_conf = self.clip.analyze(frame)
+            self.clip = None
 
-        scene_state = SceneState(
-            condition=clip_condition,
-            severity=(1.0 - clip_conf),  # ✅ BETTER logic
-            brightness=0.0,
-            blur_score=0.0,
-            fog_score=0.0,
+        print("✓ AdaptiveDetector ready")
+
+    # ========================================================
+    # FALLBACK CLEAR SCENE
+    # ========================================================
+
+    def _default_scene(self) -> SceneState:
+
+        return SceneState(
+            condition="CLEAR",
+            severity=0.0,
+            confidence=1.0,
             processing_ms=0.0
         )
 
-        # ✅ STEP 2: YOLO detection
+    # ========================================================
+    # SCENE OUTPUT NORMALIZER
+    # ========================================================
+
+    def _get_scene_state(
+        self,
+        frame: np.ndarray
+    ) -> SceneState:
+
+        if self.clip is None:
+
+            return self._default_scene()
+
+        try:
+
+            scene = self.clip.analyze(frame)
+
+            # New API: analyze() returns SceneState
+            if isinstance(scene, SceneState):
+
+                return scene
+
+            # Old API compatibility: analyze() returns tuple
+            if isinstance(scene, tuple) and len(scene) == 2:
+
+                condition, confidence = scene
+
+                return SceneState(
+                    condition=condition,
+                    severity=1.0 - float(confidence),
+                    confidence=float(confidence),
+                    processing_ms=getattr(
+                        self.clip,
+                        "last_processing_ms",
+                        0.0
+                    )
+                )
+
+            return self._default_scene()
+
+        except Exception as e:
+
+            print(f"[WARNING] Scene analysis failed: {e}")
+
+            return self._default_scene()
+
+    # ========================================================
+    # GEOMETRY DISTANCE
+    # ========================================================
+
+    def _estimate_distance(
+        self,
+        bbox: List[int],
+        class_name: str
+    ) -> float:
+
+        x1, y1, x2, y2 = bbox
+
+        h_px = max(
+            y2 - y1,
+            1
+        )
+
+        real_h = self.REAL_HEIGHTS.get(
+            class_name,
+            1.5
+        )
+
+        distance = (
+            self.focal_length *
+            real_h
+        ) / h_px
+
+        return round(
+            float(
+                np.clip(
+                    distance,
+                    1.0,
+                    100.0
+                )
+            ),
+            1
+        )
+
+    # ========================================================
+    # MAIN PROCESS
+    # ========================================================
+
+    def process(
+        self,
+        frame: np.ndarray
+    ) -> FrameOutput:
+
+        t_total = time.perf_counter()
+
+        self.frame_id += 1
+
+        # ----------------------------------------------------
+        # STEP 1: Scene detection
+        # ----------------------------------------------------
+        scene_state = self._get_scene_state(
+            frame
+        )
+
+        # ----------------------------------------------------
+        # STEP 2: YOLO detection
+        # ----------------------------------------------------
+        # Run YOLO slightly lower than final threshold so that
+        # adjusted-confidence filtering can be applied after
+        # scene penalty.
+        # ----------------------------------------------------
+        model_conf = max(
+            0.10,
+            scene_state.conf_threshold * 0.70
+        )
+
         results = self.model(
             frame,
-            conf=scene_state.conf_threshold,
-            verbose=False
+            conf=model_conf,
+            verbose=False,
+            device=self.device
         )
 
         result = results[0]
 
-        # ✅ STEP 3: Process detections
         detections = []
 
-        for box in result.boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            raw_conf = float(box.conf[0])
-            cls_name = self.model.names[int(box.cls[0])]
+        # ----------------------------------------------------
+        # STEP 3: Process detections
+        # ----------------------------------------------------
+        if result.boxes is not None:
 
-            if cls_name not in self.ADAS_CLASSES:
-                continue
+            for box in result.boxes:
 
-            adj_conf = raw_conf * scene_state.confidence_penalty
+                x1, y1, x2, y2 = map(
+                    int,
+                    box.xyxy[0].tolist()
+                )
 
-            h_px = max(y2 - y1, 1)
-            r_h = self.REAL_HEIGHTS.get(cls_name, 1.5)
-            dist = round(self.FOCAL_LENGTH * r_h / h_px, 1)
+                raw_conf = float(
+                    box.conf[0].item()
+                )
 
-            detections.append(Detection(
-                class_name=cls_name,
-                raw_confidence=round(raw_conf, 3),
-                adj_confidence=round(adj_conf, 3),
-                bbox=[x1, y1, x2, y2],
-                width_px=x2-x1,
-                height_px=h_px,
-                est_distance_m=dist,
-                is_vru=(cls_name in self.VRU_CLASSES)
-            ))
+                cls_name = self.model.names[
+                    int(box.cls[0].item())
+                ]
 
-        total_ms = (time.perf_counter() - t_total) * 1000
+                if cls_name not in self.ADAS_CLASSES:
+                    continue
+
+                adj_conf = (
+                    raw_conf *
+                    scene_state.confidence_penalty
+                )
+
+                # Final adaptive thresholding after penalty
+                if adj_conf < scene_state.conf_threshold:
+                    continue
+
+                h_px = max(
+                    y2 - y1,
+                    1
+                )
+
+                w_px = max(
+                    x2 - x1,
+                    1
+                )
+
+                dist = self._estimate_distance(
+                    [x1, y1, x2, y2],
+                    cls_name
+                )
+
+                detections.append(
+                    Detection(
+                        class_name=cls_name,
+                        raw_confidence=round(raw_conf, 3),
+                        adj_confidence=round(adj_conf, 3),
+                        bbox=[x1, y1, x2, y2],
+                        width_px=w_px,
+                        height_px=h_px,
+                        est_distance_m=dist,
+                        is_vru=(
+                            cls_name in self.VRU_CLASSES
+                        )
+                    )
+                )
+
+        total_ms = (
+            time.perf_counter() -
+            t_total
+        ) * 1000
 
         return FrameOutput(
             frame_id=self.frame_id,
@@ -173,96 +445,228 @@ class AdaptiveDetector:
             detections=detections,
             n_objects=len(detections),
             processing_ms=total_ms,
-            within_budget=(total_ms <= self.budget)
+            within_budget=(
+                total_ms <= self.budget
+            )
         )
 
-    def draw(self, frame: np.ndarray, output: FrameOutput) -> np.ndarray:
+    # ========================================================
+    # DRAW OUTPUT
+    # ========================================================
+
+    def draw(
+        self,
+        frame: np.ndarray,
+        output: FrameOutput
+    ) -> np.ndarray:
 
         vis = frame.copy()
+
         h, w = vis.shape[:2]
 
-        COLORS = {
-            'person': (255, 50, 50),
-            'bicycle': (255, 165, 0),
-            'motorcycle': (255, 140, 0),
-            'car': (50, 205, 50),
-            'truck': (0, 128, 255),
-            'bus': (128, 0, 255),
-            'traffic light': (255, 255, 0),
-            'stop sign': (255, 0, 128),
-        }
-
-        COND_COLORS = {
-            'CLEAR': (0, 255, 0),
-            'NIGHT': (100, 100, 255),
-            'FOG': (200, 200, 200),
-            'RAIN': (0, 200, 255),
-            'GLARE': (255, 255, 0),
-            'DUST': (200, 150, 50),
-        }
-
+        # ----------------------------------------------------
+        # Draw detections
+        # ----------------------------------------------------
         for det in output.detections:
+
             x1, y1, x2, y2 = det.bbox
-            color = COLORS.get(det.class_name, (200,200,200))
-            thickness = 3 if det.is_vru else 2
 
-            cv2.rectangle(vis, (x1,y1), (x2,y2), color, thickness)
+            color = self.COLORS.get(
+                det.class_name,
+                (200, 200, 200)
+            )
 
-            label = f"{det.class_name} {det.adj_confidence:.2f} {det.est_distance_m}m"
+            thickness = (
+                3
+                if det.is_vru
+                else 2
+            )
+
+            cv2.rectangle(
+                vis,
+                (x1, y1),
+                (x2, y2),
+                color,
+                thickness
+            )
+
+            label = (
+                f"{det.class_name} "
+                f"{det.adj_confidence:.2f} "
+                f"{det.est_distance_m:.1f}m"
+            )
 
             (tw, th), _ = cv2.getTextSize(
-                label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
+                label,
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                1
+            )
 
-            cv2.rectangle(vis, (x1, y1-th-8), (x1+tw+2, y1), color, -1)
+            y_text = max(
+                y1,
+                th + 10
+            )
 
-            cv2.putText(vis, label, (x1+1, y1-4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0), 1)
+            cv2.rectangle(
+                vis,
+                (x1, y_text - th - 8),
+                (x1 + tw + 4, y_text),
+                color,
+                -1
+            )
+
+            cv2.putText(
+                vis,
+                label,
+                (x1 + 2, y_text - 4),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.45,
+                (0, 0, 0),
+                1,
+                cv2.LINE_AA
+            )
 
             if det.is_vru:
-                cv2.putText(vis, "VRU",
-                            (x1, y2+15),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.4, (255, 50, 50), 2)
 
+                cv2.putText(
+                    vis,
+                    "VRU",
+                    (x1, min(h - 5, y2 + 15)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (255, 50, 50),
+                    2,
+                    cv2.LINE_AA
+                )
+
+        # ----------------------------------------------------
+        # Scene badge
+        # ----------------------------------------------------
         cond = output.scene.condition
-        color = COND_COLORS.get(cond, (255,255,255))
 
-        badge = f"SCENE: {cond} ({output.scene.severity:.2f})"
+        color = self.COND_COLORS.get(
+            cond,
+            (255, 255, 255)
+        )
 
-        cv2.rectangle(vis, (8, 8), (300, 35), (0, 0, 0), -1)
+        badge = (
+            f"SCENE: {cond} "
+            f"conf={output.scene.confidence:.2f} "
+            f"sev={output.scene.severity:.2f}"
+        )
 
-        cv2.putText(vis, badge, (12, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        cv2.rectangle(
+            vis,
+            (8, 8),
+            (430, 36),
+            (0, 0, 0),
+            -1
+        )
 
-        thresh_txt = f"CONF THRESH: {output.scene.conf_threshold}"
+        cv2.putText(
+            vis,
+            badge,
+            (12, 28),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            color,
+            2,
+            cv2.LINE_AA
+        )
 
-        cv2.rectangle(vis, (8, 38), (260, 62), (0, 0, 0), -1)
+        # ----------------------------------------------------
+        # Threshold badge
+        # ----------------------------------------------------
+        thresh_txt = (
+            f"THRESH:{output.scene.conf_threshold:.2f} "
+            f"PEN:{output.scene.confidence_penalty:.2f}"
+        )
 
-        cv2.putText(vis, thresh_txt, (12, 57),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.55, (200, 200, 200), 1)
+        cv2.rectangle(
+            vis,
+            (8, 40),
+            (310, 66),
+            (0, 0, 0),
+            -1
+        )
 
-        cv2.rectangle(vis, (w-200, 8), (w-5, 62), (0, 0, 0), -1)
+        cv2.putText(
+            vis,
+            thresh_txt,
+            (12, 59),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            (220, 220, 220),
+            1,
+            cv2.LINE_AA
+        )
 
-        cv2.putText(vis, f"Objects: {output.n_objects}",
-                    (w-195, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, (0, 255, 200), 2)
+        # ----------------------------------------------------
+        # Object + latency badge
+        # ----------------------------------------------------
+        cv2.rectangle(
+            vis,
+            (w - 250, 8),
+            (w - 5, 66),
+            (0, 0, 0),
+            -1
+        )
 
-        budget_col = (0,255,0) if output.within_budget else (0,0,255)
+        cv2.putText(
+            vis,
+            f"Objects: {output.n_objects}",
+            (w - 240, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (0, 255, 200),
+            2,
+            cv2.LINE_AA
+        )
 
-        cv2.putText(vis,
-                    f"{output.processing_ms:.0f}ms {'✓' if output.within_budget else '!'}",
-                    (w-195, 55),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6, budget_col, 2)
+        budget_col = (
+            (0, 255, 0)
+            if output.within_budget
+            else (0, 0, 255)
+        )
 
-        cv2.rectangle(vis, (0, h-30), (w, h), (0, 0, 0), -1)
+        cv2.putText(
+            vis,
+            (
+                f"{output.processing_ms:.0f}ms "
+                f"{'OK' if output.within_budget else 'SLOW'}"
+            ),
+            (w - 240, 56),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            budget_col,
+            2,
+            cv2.LINE_AA
+        )
 
-        cv2.putText(vis,
-                    f"NeuroSentinel v3 | Frame {output.frame_id} | YOLOv8s | Tata Technologies",
-                    (10, h-10),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45, (150, 150, 150), 1)
+        # ----------------------------------------------------
+        # Footer
+        # ----------------------------------------------------
+        cv2.rectangle(
+            vis,
+            (0, h - 32),
+            (w, h),
+            (0, 0, 0),
+            -1
+        )
+
+        cv2.putText(
+            vis,
+            (
+                f"NeuroSentinel v3 | Frame {output.frame_id} | "
+                f"{self.model_weights} | Adaptive Scene-Aware Detection"
+            ),
+            (10, h - 11),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (170, 170, 170),
+            1,
+            cv2.LINE_AA
+        )
 
         return vis

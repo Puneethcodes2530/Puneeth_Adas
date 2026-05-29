@@ -11,7 +11,7 @@ Features:
     - bbox height growth / tau-margin
 ✓ Weighted risk scoring
 ✓ FCW / AEB / VRU-ready output
-✓ CPU-friendly configurable settings
+✓ CPU/GPU-friendly configurable settings
 """
 
 import cv2
@@ -70,7 +70,7 @@ class TrackedObject:
 
 class TTCEngine:
     """
-    TTC is estimated using two complementary methods:
+    TTC estimation uses two complementary signals:
 
     1. Distance velocity:
        If distance is reducing over time, estimate TTC.
@@ -86,24 +86,29 @@ class TTCEngine:
         self.dt = 1.0 / max(fps, 1e-6)
 
     def _zone(self, ttc: float) -> str:
+
         if ttc < 1.5:
             return "CRITICAL"
+
         if ttc < 3.0:
             return "WARNING"
+
         if ttc < 6.0:
             return "CAUTION"
+
         return "SAFE"
 
     def compute(self, state: TrackState) -> TTCResult:
 
         if len(state.distances) < 3:
+
             return TTCResult(
                 value=None,
                 zone="SAFE"
             )
 
         # ----------------------------------------------------
-        # PATH A: Distance-velocity TTC
+        # PATH A: DISTANCE-VELOCITY TTC
         # ----------------------------------------------------
         d = list(state.distances)
 
@@ -132,7 +137,7 @@ class TTCEngine:
             )
 
         # ----------------------------------------------------
-        # PATH B: Tau-margin from bbox height growth
+        # PATH B: TAU-MARGIN FROM BBOX HEIGHT GROWTH
         # ----------------------------------------------------
         ttc_b = 999.0
         sig_b = 999.0
@@ -168,7 +173,7 @@ class TTCEngine:
                 )
 
         # ----------------------------------------------------
-        # ARBITRATION
+        # TTC ARBITRATION
         # ----------------------------------------------------
         if ttc_a >= 99.0 and ttc_b >= 99.0:
 
@@ -187,7 +192,7 @@ class TTCEngine:
 
         else:
 
-            # Inverse variance weighting.
+            # Inverse-variance weighting.
             w_a = 1.0 / (
                 v_std ** 2 + 1e-6
             )
@@ -242,14 +247,14 @@ class Phase4TrackerPipeline:
     }
 
     YOLO_CLASSES = [
-        0,   # person
-        1,   # bicycle
-        2,   # car
-        3,   # motorcycle
-        5,   # bus
-        7,   # truck
-        9,   # traffic light
-        11   # stop sign
+        0,    # person
+        1,    # bicycle
+        2,    # car
+        3,    # motorcycle
+        5,    # bus
+        7,    # truck
+        9,    # traffic light
+        11    # stop sign
     ]
 
     def __init__(
@@ -269,7 +274,10 @@ class Phase4TrackerPipeline:
         print("=" * 60)
 
         self.model_weights = model_weights
-        self.model = YOLO(model_weights)
+
+        self.model = YOLO(
+            model_weights
+        )
 
         print(f"✓ YOLO loaded: {model_weights}")
 
@@ -314,7 +322,7 @@ class Phase4TrackerPipeline:
         enhanced = frame.copy()
 
         # ----------------------------------------------------
-        # Night enhancement
+        # NIGHT ENHANCEMENT
         # ----------------------------------------------------
         if brightness < 75:
 
@@ -337,7 +345,7 @@ class Phase4TrackerPipeline:
             )
 
         # ----------------------------------------------------
-        # CLAHE contrast enhancement
+        # CLAHE CONTRAST ENHANCEMENT
         # ----------------------------------------------------
         lab = cv2.cvtColor(
             enhanced,
@@ -431,7 +439,7 @@ class Phase4TrackerPipeline:
         )
 
         # ----------------------------------------------------
-        # If no depth, return geometry
+        # IF NO DEPTH, RETURN GEOMETRY
         # ----------------------------------------------------
         if depth_map is None:
             return geo_distance
@@ -510,7 +518,7 @@ class Phase4TrackerPipeline:
         # ----------------------------------------------------
         #
         # Depth Anything is relative, not metric.
-        # This is only a weak correction signal.
+        # This is only used as weak correction.
         # ----------------------------------------------------
         depth_distance = (
             depth_val * 22.0
@@ -525,7 +533,7 @@ class Phase4TrackerPipeline:
         )
 
         # ----------------------------------------------------
-        # SMART GEOMETRY-FIRST FUSION
+        # GEOMETRY-FIRST DEPTH FUSION
         # ----------------------------------------------------
         if depth_conf < 0.45:
 
@@ -578,7 +586,7 @@ class Phase4TrackerPipeline:
     ) -> Tuple[float, str]:
 
         # ----------------------------------------------------
-        # TTC component: 45%
+        # TTC COMPONENT: 45%
         # ----------------------------------------------------
         if ttc.value is None:
 
@@ -601,7 +609,7 @@ class Phase4TrackerPipeline:
             ttc_s = 0.1
 
         # ----------------------------------------------------
-        # Class component: 25%
+        # CLASS COMPONENT: 25%
         # ----------------------------------------------------
         cls_s = self.CLASS_WEIGHTS.get(
             class_name,
@@ -616,7 +624,7 @@ class Phase4TrackerPipeline:
             )
 
         # ----------------------------------------------------
-        # Lane component: 20%
+        # EGO-LANE COMPONENT: 20%
         # ----------------------------------------------------
         cx = (
             bbox[0] +
@@ -636,7 +644,7 @@ class Phase4TrackerPipeline:
         )
 
         # ----------------------------------------------------
-        # Distance component: 10%
+        # DISTANCE COMPONENT: 10%
         # ----------------------------------------------------
         if distance_m < 10:
 
@@ -651,7 +659,7 @@ class Phase4TrackerPipeline:
             dist_s = 0.2
 
         # ----------------------------------------------------
-        # Weighted final score
+        # FINAL WEIGHTED SCORE
         # ----------------------------------------------------
         score = (
             0.45 * ttc_s +
@@ -868,7 +876,7 @@ class Phase4TrackerPipeline:
                     cls_name
                 )
 
-                # Light distance smoothing per track
+                # Light distance smoothing per track.
                 if len(state.distances) > 0:
 
                     previous = state.distances[-1]

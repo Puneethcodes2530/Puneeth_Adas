@@ -1,179 +1,501 @@
-import cv2
+"""
+NeuroSentinel v3 — Tracking + TTC Demo
+
+Purpose:
+- Process an ordered image sequence from one folder
+- Run final ADAS perception pipeline
+- Show detection + distance + TTC + risk
+- Save sample frames
+- Save grid visualization
+- Optionally save output video
+
+Important:
+TTC is meaningful only when images are sequential frames
+from the same drive/video. Random images will usually show TTC:N/A.
+"""
+
 import os
-import glob
 import sys
+import glob
+import cv2
+import numpy as np
 import matplotlib.pyplot as plt
 
-sys.path.insert(0, os.path.abspath('.'))
 
-from perception.tracker import (
-    Phase4TrackerPipeline
+# ============================================================
+# USER INPUT — CHANGE THIS PATH ONLY
+# ============================================================
+
+IMAGE_FOLDER = r"C:\Users\PTT933267\Downloads\Puneeth_Adas\Datasets\BDD100k_Extracted\bdd100k\bdd100k\images\100k\test\testA"
+
+# If IDD has sequential frames, use this instead:
+# IMAGE_FOLDER = r"C:\Users\PTT933267\Downloads\Puneeth_Adas\Datasets\IDD\22Gb IDD Detection(Main)\JPEGImages\frontFar"
+
+MAX_FRAMES = 60
+SAVE_EVERY_N_FRAMES = 10
+
+MODEL_WEIGHTS = "yolov8s.pt"
+IMG_SIZE = 640
+CONF_THRESHOLD = 0.35
+
+SAVE_VIDEO = True
+SHOW_GRID = True
+
+
+# ============================================================
+# PROJECT ROOT
+# ============================================================
+
+ROOT = os.path.abspath(
+    os.path.dirname(
+        os.path.dirname(__file__)
+    )
 )
 
-# ============================================================
-# IMAGE PATH
-# ============================================================
+sys.path.insert(
+    0,
+    ROOT
+)
 
-IMAGE_FOLDER = r"C:\Users\PTT933267\Downloads\Puneeth_Adas\Datasets\BDD100k_Extracted\bdd100k\bdd100k\images\100k\test"
+print("Project root:", ROOT)
 
-# ============================================================
-# LOAD PIPELINE
-# ============================================================
-
-pipe = Phase4TrackerPipeline()
-
-images = sorted(
-    glob.glob(f"{IMAGE_FOLDER}/*.jpg")
-)[:60]
-
-if len(images) == 0:
-
-    print("No images found")
-
-    exit()
-
-print(f"Processing {len(images)} frames")
 
 # ============================================================
-# OUTPUT
+# IMPORTS
 # ============================================================
+
+from perception.tracker import Phase4TrackerPipeline
+from perception.depth_estimator import DepthEstimatorDA
+
+
+# ============================================================
+# OUTPUT DIRS
+# ============================================================
+
+OUTPUT_DIR = os.path.join(
+    ROOT,
+    "outputs",
+    "phase4_tracking"
+)
+
+FRAME_DIR = os.path.join(
+    OUTPUT_DIR,
+    "frames"
+)
 
 os.makedirs(
-    "outputs/phase4",
+    OUTPUT_DIR,
     exist_ok=True
 )
 
-sample_frames = []
+os.makedirs(
+    FRAME_DIR,
+    exist_ok=True
+)
+
 
 # ============================================================
-# LOOP
+# DEPTH ENGINE
 # ============================================================
 
-for idx, img_path in enumerate(images):
+print("[INFO] Loading depth engine...")
 
-    frame = cv2.imread(img_path)
+depth_engine = DepthEstimatorDA()
 
-    if frame is None:
-        continue
 
-    objects, depth_map, latency = pipe.process(
-        frame
-    )
+def depth_fn(frame):
+    depth_output = depth_engine.estimate(frame)
+    return depth_output.depth_map
 
-    vis = pipe.draw(
 
-        frame,
+# ============================================================
+# IMAGE LOADER
+# ============================================================
 
-        objects,
+def find_images(folder, limit=60):
 
-        latency
-    )
+    if not os.path.exists(folder):
+        raise FileNotFoundError(
+            f"Image folder not found: {folder}"
+        )
 
-    # --------------------------------------------------------
-    # SAVE SAMPLE
-    # --------------------------------------------------------
+    patterns = [
+        "*.jpg",
+        "*.jpeg",
+        "*.png",
+        "**/*.jpg",
+        "**/*.jpeg",
+        "**/*.png"
+    ]
 
-    if idx % 10 == 0:
+    images = []
 
-        sample_frames.append(
-
-            (
-                idx,
-
-                vis.copy()
+    for pattern in patterns:
+        images.extend(
+            glob.glob(
+                os.path.join(folder, pattern),
+                recursive=True
             )
         )
 
-    # --------------------------------------------------------
-    # CONSOLE
-    # --------------------------------------------------------
-
-    print(
-
-        f"[{idx+1}/{len(images)}] "
-
-        f"Objects:{len(objects)} "
-
-        f"Latency:{latency:.0f}ms"
+    images = sorted(
+        list(set(images))
     )
 
+    return images[:limit]
+
+
 # ============================================================
-# GRID
+# DEPTH VISUALIZATION
 # ============================================================
 
-fig, axes = plt.subplots(
+def make_depth_vis(depth_map, target_shape):
 
-    2,
+    h, w = target_shape[:2]
 
-    3,
+    if depth_map is None:
 
-    figsize=(18, 10)
-)
-
-fig.patch.set_facecolor('#0a0a1a')
-
-fig.suptitle(
-
-    'NeuroSentinel v3 — Phase 4\n'
-
-    'Tracking + TTC + Risk',
-
-    fontsize=14,
-
-    fontweight='bold',
-
-    color='white'
-)
-
-axes = axes.flatten()
-
-for i, (frame_idx, vis) in enumerate(
-    sample_frames[:6]
-):
-
-    axes[i].imshow(
-        cv2.cvtColor(
-            vis,
-            cv2.COLOR_BGR2RGB
+        blank = np.zeros(
+            (h, w, 3),
+            dtype=np.uint8
         )
+
+        cv2.putText(
+            blank,
+            "No depth map",
+            (30, 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA
+        )
+
+        return blank
+
+    d = depth_map.copy()
+
+    d = (
+        (d - d.min()) /
+        (d.max() - d.min() + 1e-6)
     )
 
-    axes[i].set_title(
+    d = (
+        d * 255
+    ).astype(np.uint8)
 
-        f"Frame {frame_idx}",
-
-        color='white'
+    d_col = cv2.applyColorMap(
+        d,
+        cv2.COLORMAP_MAGMA
     )
 
-    axes[i].axis('off')
+    if d_col.shape[:2] != (h, w):
 
-for i in range(
-    len(sample_frames),
-    6
-):
+        d_col = cv2.resize(
+            d_col,
+            (w, h)
+        )
 
-    axes[i].set_visible(False)
+    return d_col
 
-plt.tight_layout()
 
-save_path = (
-    "outputs/phase4/"
-    "phase4_tracking_grid.png"
-)
+# ============================================================
+# MAIN
+# ============================================================
 
-plt.savefig(
+def main():
 
-    save_path,
+    print("=" * 70)
+    print("NeuroSentinel v3 — Tracking + TTC Demo")
+    print("=" * 70)
 
-    dpi=150,
+    print("Image folder:", IMAGE_FOLDER)
 
-    bbox_inches='tight',
+    images = find_images(
+        IMAGE_FOLDER,
+        limit=MAX_FRAMES
+    )
 
-    facecolor='#0a0a1a'
-)
+    if len(images) == 0:
+        print("[ERROR] No images found.")
+        return
 
-plt.show()
+    print(f"Processing {len(images)} frames")
 
-print(f"\n✓ Saved: {save_path}")
+    # --------------------------------------------------------
+    # Load pipeline
+    # --------------------------------------------------------
 
-print("\n🎯 Phase 4 COMPLETE")
+    pipe = Phase4TrackerPipeline(
+        model_weights=MODEL_WEIGHTS,
+        depth_fn=depth_fn,
+        fps=30,
+        imgsz=IMG_SIZE,
+        conf=CONF_THRESHOLD,
+        use_tracker=True
+    )
+
+    sample_frames = []
+    latencies = []
+    object_counts = []
+
+    video_writer = None
+
+    # --------------------------------------------------------
+    # Process frames
+    # --------------------------------------------------------
+
+    for idx, img_path in enumerate(images):
+
+        frame = cv2.imread(
+            img_path
+        )
+
+        if frame is None:
+            print("[WARNING] Could not read:", img_path)
+            continue
+
+        objects, depth_map, latency = pipe.process(
+            frame
+        )
+
+        vis = pipe.draw(
+            frame,
+            objects,
+            latency
+        )
+
+        latencies.append(
+            latency
+        )
+
+        object_counts.append(
+            len(objects)
+        )
+
+        # ----------------------------------------------------
+        # Save video
+        # ----------------------------------------------------
+
+        if SAVE_VIDEO:
+
+            if video_writer is None:
+
+                h, w = vis.shape[:2]
+
+                video_path = os.path.join(
+                    OUTPUT_DIR,
+                    "phase4_tracking_demo.mp4"
+                )
+
+                fourcc = cv2.VideoWriter_fourcc(
+                    *"mp4v"
+                )
+
+                video_writer = cv2.VideoWriter(
+                    video_path,
+                    fourcc,
+                    10,
+                    (w, h)
+                )
+
+            video_writer.write(
+                vis
+            )
+
+        # ----------------------------------------------------
+        # Save sample frames
+        # ----------------------------------------------------
+
+        if idx % SAVE_EVERY_N_FRAMES == 0:
+
+            frame_save_path = os.path.join(
+                FRAME_DIR,
+                f"frame_{idx:04d}.png"
+            )
+
+            cv2.imwrite(
+                frame_save_path,
+                vis
+            )
+
+            depth_vis = make_depth_vis(
+                depth_map,
+                frame.shape
+            )
+
+            combined = np.hstack(
+                [
+                    vis,
+                    depth_vis
+                ]
+            )
+
+            combined_save_path = os.path.join(
+                FRAME_DIR,
+                f"frame_{idx:04d}_combined.png"
+            )
+
+            cv2.imwrite(
+                combined_save_path,
+                combined
+            )
+
+            sample_frames.append(
+                (
+                    idx,
+                    vis,
+                    len(objects),
+                    latency
+                )
+            )
+
+        # ----------------------------------------------------
+        # Console print
+        # ----------------------------------------------------
+
+        print(
+            f"[{idx + 1:03d}/{len(images)}] "
+            f"{os.path.basename(img_path)[:28]:<28} "
+            f"objects:{len(objects):<3} "
+            f"latency:{latency:.0f}ms"
+        )
+
+        for obj in objects[:5]:
+
+            print(
+                f"   ID:{obj.track_id:<5} "
+                f"{obj.class_name:<12} "
+                f"dist:{obj.distance_m:<6.1f}m "
+                f"TTC:{obj.ttc.value if obj.ttc.value is not None else 'N/A':<6} "
+                f"risk:{obj.risk:<9} "
+                f"score:{obj.risk_score:.2f}"
+            )
+
+    if video_writer is not None:
+        video_writer.release()
+        print("\n✓ Video saved:", video_path)
+
+    # ========================================================
+    # GRID VISUALIZATION
+    # ========================================================
+
+    if SHOW_GRID and len(sample_frames) > 0:
+
+        n = min(
+            len(sample_frames),
+            6
+        )
+
+        fig, axes = plt.subplots(
+            2,
+            3,
+            figsize=(20, 12)
+        )
+
+        fig.patch.set_facecolor(
+            "#0a0a1a"
+        )
+
+        fig.suptitle(
+            "NeuroSentinel v3 — Phase 4 Tracking + TTC + Risk Demo",
+            fontsize=15,
+            fontweight="bold",
+            color="white"
+        )
+
+        axes = axes.flatten()
+
+        for i in range(6):
+
+            ax = axes[i]
+
+            if i >= n:
+
+                ax.axis("off")
+                continue
+
+            frame_idx, vis, n_obj, latency = sample_frames[i]
+
+            ax.imshow(
+                cv2.cvtColor(
+                    vis,
+                    cv2.COLOR_BGR2RGB
+                )
+            )
+
+            ax.set_title(
+                f"Frame {frame_idx} | Objects:{n_obj} | {latency:.0f}ms",
+                color="white",
+                fontsize=9
+            )
+
+            ax.axis("off")
+
+        plt.tight_layout()
+
+        grid_path = os.path.join(
+            OUTPUT_DIR,
+            "phase4_tracking_grid.png"
+        )
+
+        plt.savefig(
+            grid_path,
+            dpi=150,
+            bbox_inches="tight",
+            facecolor="#0a0a1a"
+        )
+
+        plt.show()
+
+        print("✓ Grid saved:", grid_path)
+
+    # ========================================================
+    # SUMMARY
+    # ========================================================
+
+    if len(latencies) > 0:
+
+        print("\n" + "=" * 70)
+        print("PHASE 4 TRACKING SUMMARY")
+        print("=" * 70)
+
+        print(
+            f"Frames processed: {len(latencies)}"
+        )
+
+        print(
+            f"Avg latency: {np.mean(latencies):.1f}ms"
+        )
+
+        print(
+            f"P50 latency: {np.percentile(latencies, 50):.1f}ms"
+        )
+
+        print(
+            f"P90 latency: {np.percentile(latencies, 90):.1f}ms"
+        )
+
+        print(
+            f"P99 latency: {np.percentile(latencies, 99):.1f}ms"
+        )
+
+        print(
+            f"FPS: {1000 / np.mean(latencies):.2f}"
+        )
+
+        print(
+            f"Avg objects/frame: {np.mean(object_counts):.1f}"
+        )
+
+    print("\n🎯 Phase 4 Tracking Demo Complete")
+    print("Outputs saved in:", OUTPUT_DIR)
+
+
+# ============================================================
+# ENTRY
+# ============================================================
+
+if __name__ == "__main__":
+
+    main()
